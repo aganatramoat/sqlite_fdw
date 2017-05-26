@@ -41,6 +41,8 @@
 #include <sqlite3.h>
 #include <sys/stat.h>
 
+#define MODULE_LOG_LEVEL WARNING
+
 
 /** Place in a separate header file later **/
 typedef struct SqliteOpt
@@ -49,15 +51,39 @@ typedef struct SqliteOpt
     char   *table;
 } SqliteOpt;
 
-extern bool is_foreign_expr(PlannerInfo *root,
-        RelOptInfo *baserel, Expr *expr);
+extern bool is_foreign_expr(
+    PlannerInfo *root,
+    RelOptInfo *baserel, 
+    Expr *expr);
 
-extern void sqlite_deparse_select(StringInfo buf,
-        PlannerInfo *root, RelOptInfo *baserel,
-        Bitmapset *attrs_used, char *svr_table, List **retrieved_attrs);
-extern void sqlite_append_where_clause(StringInfo buf,
-        PlannerInfo *root, RelOptInfo *baserel,
-        List *exprs, bool is_first, List **params);
+extern void sqlite_deparse_select(
+    StringInfo buf,
+    PlannerInfo *root, 
+    RelOptInfo *baserel,
+    Bitmapset *attrs_used, 
+    char *svr_table, 
+    List **retrieved_attrs);
+
+extern void sqlite_append_where_clause(
+    StringInfo buf,
+    PlannerInfo *root, 
+    RelOptInfo *baserel,
+    List *exprs, 
+    bool is_first, 
+    List **params);
+
+extern bool foreignSchemaTableIsRequired(
+    ImportForeignSchemaStmt *stmt, 
+    char const * tablename);
+
+extern void sqliteOpen(
+    char const *filename, 
+    sqlite3 **db);
+
+extern sqlite3_stmt * sqlitePrepare(
+    sqlite3 *db, 
+    char *query, 
+    const char **pzTail);
 /****/
 
 PG_MODULE_MAGIC;
@@ -252,7 +278,7 @@ sqlite_fdw_handler(PG_FUNCTION_ARGS)
 {
 	FdwRoutine *fdwroutine = makeNode(FdwRoutine);
 
-	elog(DEBUG1,"entering function %s",__func__);
+	elog(MODULE_LOG_LEVEL,"entering function %s",__func__);
 
 	/* assign the handlers for the FDW */
 
@@ -309,7 +335,7 @@ sqlite_fdw_validator(PG_FUNCTION_ARGS)
 	char      *svr_table = NULL;
 	ListCell  *cell;
 
-	elog(DEBUG1,"entering function %s",__func__);
+	elog(MODULE_LOG_LEVEL,"entering function %s",__func__);
 
 	/*
 	 * Check that only options supported by sqlite_fdw,
@@ -381,47 +407,6 @@ sqlite_fdw_validator(PG_FUNCTION_ARGS)
 }
 
 
-/*
- * Open the given sqlite3 file, and throw an error if the file couldn't be
- * opened
- */
-static void
-sqliteOpen(char const *filename, sqlite3 **db)
-{
-	if (sqlite3_open(filename, db) != SQLITE_OK) 
-    {
-        char const * errmsg_from_sqlite3 = pstrdup(sqlite3_errmsg(db));
-		ereport(ERROR,
-			(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
-			errmsg("Can't open sqlite database %s: %s", filename, errmsg_from_sqlite3)
-			));
-    }
-}
-
-
-/*
- * Prepare the given query. If case of error, close the db and throw an error
- */
-static sqlite3_stmt *
-sqlitePrepare(sqlite3 *db, char *query, const char **pzTail)
-{
-	int rc;
-    sqlite3_stmt *stmt;
-    
-    elog(WARNING, "entering function sqlitePrepare with \n%s", query);
-
-	/* Execute the query */
-	rc = sqlite3_prepare_v2(db, query, -1, &stmt, pzTail);
-	if (rc != SQLITE_OK)
-	{
-		sqlite3_close(db);
-		ereport(ERROR,
-			(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-			errmsg("SQL error during prepare: %s", sqlite3_errmsg(db))
-			));
-	}
-    return stmt;
-}
 
 /*
  * Check if the provided option is one of the valid options.
@@ -508,7 +493,7 @@ sqliteGetForeignRelSize(PlannerInfo *root,
 	StringInfoData        sql;
 	List                  *params_list = NULL;
     
-    elog(WARNING, "entering function sqliteGetForeignRelSize");
+    elog(MODULE_LOG_LEVEL, "entering function sqliteGetForeignRelSize");
 
     // initialize the fields of baserel that we will set
 	baserel->rows = 0;
@@ -562,7 +547,7 @@ GetEstimatedRows(char const * filename, char * sql)
 	const char	   *pzTail;
     double          estimate = 0;
     
-    elog(WARNING, "entering function GetEstimatedRows");
+    elog(MODULE_LOG_LEVEL, "entering function GetEstimatedRows");
 
 	/* Connect to the server */
 	sqliteOpen(filename, &db);
@@ -750,7 +735,7 @@ sqliteBeginForeignScan(ForeignScanState *node,
 	ForeignScan       *fsplan = (ForeignScan *) node->ss.ps.plan;
 	EState            *estate = node->ss.ps.state;
 
-	elog(WARNING, "entering function %s",__func__);
+	elog(MODULE_LOG_LEVEL, "entering function %s",__func__);
 	
     /*
 	 * We'll save private state in node->fdw_state.
@@ -814,7 +799,7 @@ sqliteIterateForeignScan(ForeignScanState *node)
 	SQLiteFdwExecutionState *festate = (SQLiteFdwExecutionState *) node->fdw_state;
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
 
-	elog(WARNING,"entering function %s",__func__);
+	elog(MODULE_LOG_LEVEL,"entering function %s",__func__);
 
 	ExecClearTuple(slot);
 
@@ -847,7 +832,7 @@ sqliteReScanForeignScan(ForeignScanState *node)
 	 * return exactly the same rows.
 	 */
 
-	elog(DEBUG1,"entering function %s",__func__);
+	elog(MODULE_LOG_LEVEL,"entering function %s",__func__);
 
 }
 
@@ -892,7 +877,7 @@ sqliteAddForeignUpdateTargets(Query *parsetree,
 	 * relies on an unchanging primary key to identify rows.)
 	 */
 
-	elog(DEBUG1,"entering function %s",__func__);
+	elog(MODULE_LOG_LEVEL,"entering function %s",__func__);
 
 }
 
@@ -923,7 +908,7 @@ sqlitePlanForeignModify(PlannerInfo *root,
 	 * BeginForeignModify will be NIL.
 	 */
 
-	elog(DEBUG1,"entering function %s",__func__);
+	elog(MODULE_LOG_LEVEL,"entering function %s",__func__);
 
 
 	return NULL;
@@ -963,7 +948,7 @@ sqliteBeginForeignModify(ModifyTableState *mtstate,
 	 * during executor startup.
 	 */
 
-	elog(DEBUG1,"entering function %s",__func__);
+	elog(MODULE_LOG_LEVEL,"entering function %s",__func__);
 
 }
 
@@ -1001,7 +986,7 @@ sqliteExecForeignInsert(EState *estate,
 	 *
 	 */
 
-	elog(DEBUG1,"entering function %s",__func__);
+	elog(MODULE_LOG_LEVEL,"entering function %s",__func__);
 
 	return slot;
 }
@@ -1040,7 +1025,7 @@ sqliteExecForeignUpdate(EState *estate,
 	 *
 	 */
 
-	elog(DEBUG1,"entering function %s",__func__);
+	elog(MODULE_LOG_LEVEL,"entering function %s",__func__);
 
 	return slot;
 }
@@ -1076,7 +1061,7 @@ sqliteExecForeignDelete(EState *estate,
 	 * from the foreign table will fail with an error message.
 	 */
 
-	elog(DEBUG1,"entering function %s",__func__);
+	elog(MODULE_LOG_LEVEL,"entering function %s",__func__);
 
 	return slot;
 }
@@ -1095,7 +1080,7 @@ sqliteEndForeignModify(EState *estate,
 	 * during executor shutdown.
 	 */
 
-	elog(DEBUG1,"entering function %s",__func__);
+	elog(MODULE_LOG_LEVEL,"entering function %s",__func__);
 
 }
 #endif
@@ -1123,7 +1108,7 @@ sqliteExplainForeignScan(ForeignScanState *node,
 	SQLiteFdwExecutionState	   *festate = (SQLiteFdwExecutionState *) node->fdw_state;
     SqliteOpt                  *opt;
 
-	elog(DEBUG1,"entering function %s",__func__);
+	elog(MODULE_LOG_LEVEL,"entering function %s",__func__);
 
 	/* Show the query (only if VERBOSE) */
 	if (es->verbose)
@@ -1189,7 +1174,7 @@ sqliteExplainForeignModify(ModifyTableState *mtstate,
 	 * information is printed during EXPLAIN.
 	 */
 
-	elog(DEBUG1,"entering function %s",__func__);
+	elog(MODULE_LOG_LEVEL,"entering function %s",__func__);
 
 }
 
@@ -1226,14 +1211,14 @@ sqliteAnalyzeForeignTable(Relation relation,
 	 * ----
 	 */
 
-	elog(DEBUG1,"entering function %s",__func__);
+	elog(MODULE_LOG_LEVEL,"entering function %s",__func__);
 
 	return false;
 }
 
 static List *
 sqliteImportForeignSchema(ImportForeignSchemaStmt *stmt,
-							 Oid serverOid)
+                          Oid serverOid)
 {
 	sqlite3		   *volatile db = NULL;
 	sqlite3_stmt   *volatile tbls = NULL;
@@ -1246,7 +1231,7 @@ sqliteImportForeignSchema(ImportForeignSchemaStmt *stmt,
 	bool			import_default = false;
 	bool			import_not_null = true;
 
-	elog(DEBUG1,"entering function %s",__func__);
+	elog(MODULE_LOG_LEVEL,"entering function %s",__func__);
 
 	/*
 	 * The only legit sqlite schema are temp and main (or name of an attached
@@ -1302,30 +1287,6 @@ sqliteImportForeignSchema(ImportForeignSchemaStmt *stmt,
 		appendStringInfo(&query_tbl, "SELECT name FROM sqlite_master WHERE type = 'table'");
 		appendStringInfo(&query_tbl, " AND name NOT LIKE 'sqlite_%%'");
 
-		/* Handle LIMIT TO / EXCEPT clauses in IMPORT FOREIGN SCHEMA statement */
-		if (stmt->list_type == FDW_IMPORT_SCHEMA_LIMIT_TO ||
-			stmt->list_type == FDW_IMPORT_SCHEMA_EXCEPT)
-		{
-			bool		first_item = true;
-
-			appendStringInfoString(&query_tbl, " AND name ");
-			if (stmt->list_type == FDW_IMPORT_SCHEMA_EXCEPT)
-				appendStringInfoString(&query_tbl, "NOT ");
-			appendStringInfoString(&query_tbl, "IN (");
-
-			foreach(lc, stmt->table_list)
-			{
-				RangeVar *rv = (RangeVar *) lfirst(lc);
-
-				if (first_item)
-					first_item = false;
-				else
-					appendStringInfoString(&query_tbl, ", ");
-
-				appendStringInfoString(&query_tbl, quote_literal_cstr(rv->relname));
-			}
-			appendStringInfoChar(&query_tbl, ')');
-		}
 
 		/* Iterate to all matching tables, and get their definition */
 		tbls = sqlitePrepare(db, query_tbl.data, &pzTail);
@@ -1338,62 +1299,55 @@ sqliteImportForeignSchema(ImportForeignSchemaStmt *stmt,
 			int				i = 0;
 
 			tbl_name = (char *) sqlite3_column_text(tbls, 0);
+            if ( foreignSchemaTableIsRequired(stmt, tbl_name) )
+            {
+                cft_stmt = constructCreateForeignTableStatement(stmt, db, tbl_name);
+                /* start building the CFT stmt */
 
-			/*
-			 * user-defined list of tables has been handled in main query, don't
-			 * try to do the job here again
-			 */
 
-			/* start building the CFT stmt */
-			initStringInfo(&cft_stmt);
-			appendStringInfo(&cft_stmt, "CREATE FOREIGN TABLE %s.%s (\n",
-					stmt->local_schema, quote_identifier(tbl_name));
+                cols = sqlitePrepare(db, query_cols, &pzTail);
+                while (sqlite3_step(cols) == SQLITE_ROW)
+                {
+                    char   *col_name;
+                    char   *typ_name;
+                    bool	not_null;
+                    char   *default_val;
 
-			query_cols = palloc0(strlen(tbl_name) + 19 + 1);
-			sprintf(query_cols, "PRAGMA table_info(%s)", tbl_name);
+                    col_name = (char *) sqlite3_column_text(cols, 1);
+                    typ_name = (char *) sqlite3_column_text(cols, 2);
+                    not_null = (sqlite3_column_int(cols, 3) == 1);
+                    default_val = (char *) sqlite3_column_text(cols, 4);
 
-			cols = sqlitePrepare(db, query_cols, &pzTail);
-			while (sqlite3_step(cols) == SQLITE_ROW)
-			{
-				char   *col_name;
-				char   *typ_name;
-				bool	not_null;
-				char   *default_val;
+                    if (i != 0)
+                        appendStringInfo(&cft_stmt, ",\n");
 
-				col_name = (char *) sqlite3_column_text(cols, 1);
-				typ_name = (char *) sqlite3_column_text(cols, 2);
-				not_null = (sqlite3_column_int(cols, 3) == 1);
-				default_val = (char *) sqlite3_column_text(cols, 4);
+                    /* table name */
+                    appendStringInfo(&cft_stmt, "%s ",
+                            quote_identifier(col_name));
 
-				if (i != 0)
-					appendStringInfo(&cft_stmt, ",\n");
+                    /* translated datatype */
+                    sqliteTranslateType(&cft_stmt, typ_name);
 
-				/* table name */
-				appendStringInfo(&cft_stmt, "%s ",
-						quote_identifier(col_name));
+                    if (not_null && import_not_null)
+                        appendStringInfo(&cft_stmt, " NOT NULL");
 
-				/* translated datatype */
-				sqliteTranslateType(&cft_stmt, typ_name);
+                    if (default_val && import_default)
+                        appendStringInfo(&cft_stmt, " DEFAULT %s", default_val);
 
-				if (not_null && import_not_null)
-					appendStringInfo(&cft_stmt, " NOT NULL");
+                    i++;
+                }
+                appendStringInfo(&cft_stmt, "\n) SERVER %s\n"
+                        "OPTIONS (table '%s')",
+                        quote_identifier(stmt->server_name),
+                        quote_identifier(tbl_name));
 
-				if (default_val && import_default)
-					appendStringInfo(&cft_stmt, " DEFAULT %s", default_val);
+                commands = lappend(commands,
+                        pstrdup(cft_stmt.data));
 
-				i++;
-			}
-			appendStringInfo(&cft_stmt, "\n) SERVER %s\n"
-					"OPTIONS (table '%s')",
-					quote_identifier(stmt->server_name),
-					quote_identifier(tbl_name));
-
-			commands = lappend(commands,
-					pstrdup(cft_stmt.data));
-
-			/* free per-table allocated data */
-			pfree(query_cols);
-			pfree(cft_stmt.data);
+                /* free per-table allocated data */
+                pfree(query_cols);
+                pfree(cft_stmt.data);
+            }
 		}
 
 		/* Free all needed data and close connection*/

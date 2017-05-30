@@ -20,81 +20,94 @@
 #include <catalog/pg_operator.h>
 #include <catalog/pg_namespace.h>
 #include <catalog/pg_collation.h>
+#include <sqlite3.h>
+
+#include "sqlite_fdw.h"
+#include "deparse.h"
 
 
 /*
- * Context for deparseExpr
+ * Context for deparse_expr__
  */
-typedef struct deparse_expr_cxt
+typedef struct DeparseExprCxt__
 {
-	PlannerInfo *root;			/* global planner state */
-	RelOptInfo *foreignrel;		/* the foreign relation we are planning for */
-	StringInfo	buf;			/* output buffer to append to */
+	PlannerInfo *root;		/* global planner state */
+	RelOptInfo *foreignrel;	/* the foreign relation we are planning for */
+	StringInfo	buf;		/* output buffer to append to */
 	List	**params_list;	/* exprs that will become remote Params */
-} deparse_expr_cxt;
+} DeparseExprCxt__;
 
 
 /*
- * Local (per-tree-level) context for foreign_expr_walker's search.
+ * Local (per-tree-level) context for walk_foreignExpr__'s search.
  * This is concerned with identifying collations used in the expression.
  */
 typedef enum
 {
-	FDW_COLLATE_NONE,			/* expression is of a noncollatable type */
-	FDW_COLLATE_SAFE,			/* collation derives from a foreign Var */
-	FDW_COLLATE_UNSAFE			/* collation derives from something else */
+	FDW_COLLATE_NONE,	/* expression is of a noncollatable type */
+	FDW_COLLATE_SAFE,	/* collation derives from a foreign Var */
+	FDW_COLLATE_UNSAFE	/* collation derives from something else */
 } FDWCollateState;
 
 
 /*
- * Global context for foreign_expr_walker's search of an expression tree.
+ * Global context for walk_foreignExpr__'s search of an expression tree.
  */
-typedef struct foreign_glob_cxt
+typedef struct GlobalCxt__
 {
-	PlannerInfo *root;			/* global planner state */
-	RelOptInfo *foreignrel;		/* the foreign relation we are planning for */
-} foreign_glob_cxt;
+	PlannerInfo *root;		/* global planner state */
+	RelOptInfo *foreignrel;	/* the foreign relation we are planning for */
+} GlobalCxt__;
 
 
-typedef struct foreign_loc_cxt
+typedef struct LocalCxt__
 {
 	Oid			collation;		/* OID of current collation, if any */
 	FDWCollateState state;		/* state of current collation choice */
-} foreign_loc_cxt;
+} LocalCxt__;
 
 
-static char *sqlite_quote_identifier(const char *s, char q);
-static void sqlite_deparse_column_ref(StringInfo buf, 
-        int varno, int varattno, PlannerInfo *root);
-static void sqlite_deparse_target_list(StringInfo buf, 
-        PlannerInfo *root, Index rtindex,
-        Relation rel, Bitmapset *attrs_used, List **retrieved_attrs);
-static void sqlite_deparse_relation(StringInfo buf, Relation rel);
-static void deparseExpr(Expr *expr, deparse_expr_cxt *context);
-static void sqlite_deparse_var(Var *node, deparse_expr_cxt *context);
-static void sqlite_deparse_const(Const *node, deparse_expr_cxt *context);
-static void sqlite_deparse_param(Param *node, deparse_expr_cxt *context);
-static void sqlite_deparse_func_expr(FuncExpr *node, deparse_expr_cxt *context);
-static void sqlite_deparse_array_ref(ArrayRef *node, deparse_expr_cxt *context);
-static void sqlite_deparse_op_expr(OpExpr *node, deparse_expr_cxt *context);
-static void sqlite_deparse_distinct_expr(DistinctExpr *node, deparse_expr_cxt *context);
-static void sqlite_deparse_scalar_array_op_expr(ScalarArrayOpExpr *node,
-						 deparse_expr_cxt *context);
-static void sqlite_deparse_relabel_type(RelabelType *node, deparse_expr_cxt *context);
-static void sqlite_deparse_bool_expr(BoolExpr *node, deparse_expr_cxt *context);
-static void sqlite_deparse_null_test(NullTest *node, deparse_expr_cxt *context);
-static void sqlite_deparse_array_expr(ArrayExpr *node, deparse_expr_cxt *context);
-static void sqlite_print_remote_param(int paramindex, Oid paramtype, int32 paramtypmod,
-				 deparse_expr_cxt *context);
-static void sqlite_print_remote_placeholder(Oid paramtype, int32 paramtypmod,
-					deparse_expr_cxt *context);
+static char *quote_identifier__(const char *s, char q);
+
+static void deparse_columnRef__(StringInfo buf, 
+        int varno, 
+        int varattno, 
+        PlannerInfo *root);
+static void deparse_targetList__(StringInfo buf, 
+        PlannerInfo *root, 
+        Index rtindex,
+        Relation rel, 
+        Bitmapset *attrs_used, 
+        List **retrieved_attrs);
+static void deparse_relaltion__(StringInfo buf, Relation rel);
 static void deparse_interval(StringInfo buf, Datum datum);
-static void sqlite_deparse_string_literal(StringInfo buf, const char *val);
-static char* sqlite_replace_function(char *in);
-static void sqlite_deparse_operator_name(StringInfo buf, Form_pg_operator opform);
-static void sqlite_deparse_string(StringInfo buf, const char *val, bool isstr);
-static bool foreign_expr_walker(Node *node,
-        foreign_glob_cxt *glob_cxt, foreign_loc_cxt *outer_cxt);
+static void deparse_expr__(Expr *expr, DeparseExprCxt__ *context);
+static void deparse_var__(Var *, DeparseExprCxt__ *);
+static void deparse_const__(Const *, DeparseExprCxt__ *);
+static void deparse_boolExpr__(BoolExpr *, DeparseExprCxt__ *);
+static void deparse_nullTest__(NullTest *, DeparseExprCxt__ *);
+static void deparse_param__(Param *, DeparseExprCxt__ *);
+static void deparse_funcExpr__(FuncExpr *, DeparseExprCxt__ *);
+static void deparse_arrayRef__(ArrayRef *, DeparseExprCxt__ *);
+static void deparse_opExpr__(OpExpr *, DeparseExprCxt__ *);
+static void deparse_distinctExpr__(DistinctExpr *, DeparseExprCxt__ *);
+static void deparse_scalarArrayOpExpr__(ScalarArrayOpExpr *,
+						                DeparseExprCxt__ *);
+static void deparse_relabelType__(RelabelType *, DeparseExprCxt__ *);
+static void deparse_arrayExpr__(ArrayExpr *, DeparseExprCxt__ *);
+static void print_remoteParam__(int paramindex, 
+                                DeparseExprCxt__ *context);
+static void print_remotePlaceholder__(DeparseExprCxt__ *context);
+static void deparse_stringLiteral__(StringInfo buf, const char *val);
+static char* replace_function__(char *in);
+static void deparse_operatorName__(StringInfo buf, 
+                                   Form_pg_operator opform);
+static void deparse_string__(StringInfo buf, 
+                             const char *val, 
+                             bool isstr);
+static bool walk_foreignExpr__(Node *node, 
+                               GlobalCxt__ *glob_cxt, 
+                               LocalCxt__ *outer_cxt);
 static bool is_builtin(Oid oid);
 
 /*
@@ -103,19 +116,8 @@ static bool is_builtin(Oid oid);
 static char *cur_opname = NULL;
 
 
-// TODO take to header file
-void sqlite_deparse_select(StringInfo buf,
-        PlannerInfo *root, RelOptInfo *baserel,
-        Bitmapset *attrs_used, char *svr_table, List **retrieved_attrs);
-void sqlite_append_where_clause(StringInfo buf,
-        PlannerInfo *root, RelOptInfo *baserel,
-        List *exprs, bool is_first, List **params);
-bool is_foreign_expr(PlannerInfo *root,
-        RelOptInfo *baserel, Expr *expr);
-
-    
 static char *
-sqlite_quote_identifier(const char *s , char q)
+quote_identifier__(const char *s , char q)
 {
 	char  *result = palloc(strlen(s) * 2 + 3);
 	char  *r = result;
@@ -140,7 +142,10 @@ sqlite_quote_identifier(const char *s , char q)
  * If it has a column_name FDW option, use that instead of attribute name.
  */
 static void
-sqlite_deparse_column_ref(StringInfo buf, int varno, int varattno, PlannerInfo *root)
+deparse_columnRef__(StringInfo buf, 
+                    int varno, 
+                    int varattno, 
+                    PlannerInfo *root)
 {
 	RangeTblEntry *rte;
 	char          *colname = NULL;
@@ -176,7 +181,7 @@ sqlite_deparse_column_ref(StringInfo buf, int varno, int varattno, PlannerInfo *
 	if (colname == NULL)
 		colname = get_relid_attribute_name(rte->relid, varattno);
 
-	appendStringInfoString(buf, sqlite_quote_identifier(colname, '`'));
+	appendStringInfoString(buf, quote_identifier__(colname, '`'));
 }
 
 
@@ -185,12 +190,12 @@ sqlite_deparse_column_ref(StringInfo buf, int varno, int varattno, PlannerInfo *
  * This is used for both SELECT and RETURNING targetlists.
  */
 static void
-sqlite_deparse_target_list(StringInfo buf,
-				  PlannerInfo *root,
-				  Index rtindex,
-				  Relation rel,
-				  Bitmapset *attrs_used,
-				  List **retrieved_attrs)
+deparse_targetList__(StringInfo buf,
+				     PlannerInfo *root,
+				     Index rtindex,
+				     Relation rel,
+				     Bitmapset *attrs_used,
+				     List **retrieved_attrs)
 {
 	TupleDesc	tupdesc = RelationGetDescr(rel);
 	bool		have_wholerow;
@@ -220,7 +225,7 @@ sqlite_deparse_target_list(StringInfo buf,
 				appendStringInfoString(buf, ", ");
 			first = false;
 
-			sqlite_deparse_column_ref(buf, rtindex, i, root);
+			deparse_columnRef__(buf, rtindex, i, root);
 			*retrieved_attrs = lappend_int(*retrieved_attrs, i);
 		}
 	}
@@ -232,7 +237,7 @@ sqlite_deparse_target_list(StringInfo buf,
 
 
 void
-sqlite_deparse_select(StringInfo buf,
+deparse_selectStmt(StringInfo buf,
 				 PlannerInfo *root,
 				 RelOptInfo *baserel,
 				 Bitmapset *attrs_used,
@@ -248,13 +253,13 @@ sqlite_deparse_select(StringInfo buf,
 	rel = heap_open(rte->relid, NoLock);
 
 	appendStringInfoString(buf, "SELECT ");
-	sqlite_deparse_target_list(buf, root, baserel->relid, rel, attrs_used, retrieved_attrs);
+	deparse_targetList__(buf, root, baserel->relid, rel, attrs_used, retrieved_attrs);
 
 	/*
 	 * Construct FROM clause
 	 */
 	appendStringInfoString(buf, " FROM ");
-	sqlite_deparse_relation(buf, rel);
+	deparse_relaltion__(buf, rel);
 	heap_close(rel, NoLock);
 }
 
@@ -265,7 +270,7 @@ sqlite_deparse_select(StringInfo buf,
  * Similarly, schema_name FDW option overrides schema name.
  */
 static void
-sqlite_deparse_relation(StringInfo buf, Relation rel)
+deparse_relaltion__(StringInfo buf, Relation rel)
 {
 	ForeignTable  *table;
 	const char    *nspname = NULL;
@@ -298,20 +303,20 @@ sqlite_deparse_relation(StringInfo buf, Relation rel)
 		relname = RelationGetRelationName(rel);
 
 	appendStringInfo(buf, "%s.%s", 
-        sqlite_quote_identifier(nspname, '`'), 
-        sqlite_quote_identifier(relname, '`'));
+        quote_identifier__(nspname, '`'), 
+        quote_identifier__(relname, '`'));
 }
 
     
 void
-sqlite_append_where_clause(StringInfo buf,
+append_whereClause(StringInfo buf,
 				  PlannerInfo *root,
 				  RelOptInfo *baserel,
 				  List *exprs,
 				  bool is_first,
 				  List **params)
 {
-	deparse_expr_cxt context;
+	DeparseExprCxt__ context;
 	ListCell   *lc;
 
 	if (params)
@@ -334,7 +339,7 @@ sqlite_append_where_clause(StringInfo buf,
 			appendStringInfoString(buf, " AND ");
 
 		appendStringInfoChar(buf, '(');
-		deparseExpr(ri->clause, &context);
+		deparse_expr__(ri->clause, &context);
 		appendStringInfoChar(buf, ')');
 
 		is_first = false;
@@ -345,7 +350,7 @@ sqlite_append_where_clause(StringInfo buf,
 /*
  * Deparse given expression into context->buf.
  *
- * This function must support all the same node types that foreign_expr_walker
+ * This function must support all the same node types that walk_foreignExpr__
  * accepts.
  *
  * Note: unlike ruleutils.c, we just use a simple hard-wired parenthesization
@@ -353,7 +358,7 @@ sqlite_append_where_clause(StringInfo buf,
  * should be self-parenthesized.
  */
 static void
-deparseExpr(Expr *node, deparse_expr_cxt *context)
+deparse_expr__(Expr *node, DeparseExprCxt__ *context)
 {
 	if (node == NULL)
 		return;
@@ -361,40 +366,40 @@ deparseExpr(Expr *node, deparse_expr_cxt *context)
 	switch (nodeTag(node))
 	{
 		case T_Var:
-			sqlite_deparse_var((Var *) node, context);
+			deparse_var__((Var *) node, context);
 			break;
 		case T_Const:
-			sqlite_deparse_const((Const *) node, context);
+			deparse_const__((Const *) node, context);
 			break;
 		case T_Param:
-			sqlite_deparse_param((Param *) node, context);
+			deparse_param__((Param *) node, context);
 			break;
 		case T_ArrayRef:
-			sqlite_deparse_array_ref((ArrayRef *) node, context);
+			deparse_arrayRef__((ArrayRef *) node, context);
 			break;
 		case T_FuncExpr:
-			sqlite_deparse_func_expr((FuncExpr *) node, context);
+			deparse_funcExpr__((FuncExpr *) node, context);
 			break;
 		case T_OpExpr:
-			sqlite_deparse_op_expr((OpExpr *) node, context);
+			deparse_opExpr__((OpExpr *) node, context);
 			break;
 		case T_DistinctExpr:
-			sqlite_deparse_distinct_expr((DistinctExpr *) node, context);
+			deparse_distinctExpr__((DistinctExpr *) node, context);
 			break;
 		case T_ScalarArrayOpExpr:
-			sqlite_deparse_scalar_array_op_expr((ScalarArrayOpExpr *) node, context);
+			deparse_scalarArrayOpExpr__((ScalarArrayOpExpr *) node, context);
 			break;
 		case T_RelabelType:
-			sqlite_deparse_relabel_type((RelabelType *) node, context);
+			deparse_relabelType__((RelabelType *) node, context);
 			break;
 		case T_BoolExpr:
-			sqlite_deparse_bool_expr((BoolExpr *) node, context);
+			deparse_boolExpr__((BoolExpr *) node, context);
 			break;
 		case T_NullTest:
-			sqlite_deparse_null_test((NullTest *) node, context);
+			deparse_nullTest__((NullTest *) node, context);
 			break;
 		case T_ArrayExpr:
-			sqlite_deparse_array_expr((ArrayExpr *) node, context);
+			deparse_arrayExpr__((ArrayExpr *) node, context);
 			break;
 		default:
 			elog(ERROR, "unsupported expression type for deparse: %d",
@@ -413,7 +418,7 @@ deparseExpr(Expr *node, deparse_expr_cxt *context)
  * deparseParam for comments.
  */
 static void
-sqlite_deparse_var(Var *node, deparse_expr_cxt *context)
+deparse_var__(Var *node, DeparseExprCxt__ *context)
 {
 	StringInfo	buf = context->buf;
 
@@ -421,7 +426,7 @@ sqlite_deparse_var(Var *node, deparse_expr_cxt *context)
 		node->varlevelsup == 0)
 	{
 		/* Var belongs to foreign table */
-		sqlite_deparse_column_ref(buf, node->varno, node->varattno, context->root);
+		deparse_columnRef__(buf, node->varno, node->varattno, context->root);
 	}
 	else
 	{
@@ -444,11 +449,11 @@ sqlite_deparse_var(Var *node, deparse_expr_cxt *context)
 				pindex++;
 				*context->params_list = lappend(*context->params_list, node);
 			}
-			sqlite_print_remote_param(pindex, node->vartype, node->vartypmod, context);
+			print_remoteParam__(pindex, context);
 		}
 		else
 		{
-			sqlite_print_remote_placeholder(node->vartype, node->vartypmod, context);
+			print_remotePlaceholder__(context);
 		}
 	}
 }
@@ -460,7 +465,7 @@ sqlite_deparse_var(Var *node, deparse_expr_cxt *context)
  * This function has to be kept in sync with ruleutils.c's get_const_expr.
  */
 static void
-sqlite_deparse_const(Const *node, deparse_expr_cxt *context)
+deparse_const__(Const *node, DeparseExprCxt__ *context)
 {
 	StringInfo  buf = context->buf;
 	Oid         typoutput;
@@ -519,7 +524,7 @@ sqlite_deparse_const(Const *node, deparse_expr_cxt *context)
 			break;
 		default:
 			extval = OidOutputFunctionCall(typoutput, node->constvalue);
-			sqlite_deparse_string_literal(buf, extval);
+			deparse_stringLiteral__(buf, extval);
 			break;
 	}
 }
@@ -534,7 +539,7 @@ sqlite_deparse_const(Const *node, deparse_expr_cxt *context)
  * no need to identify a parameter number.
  */
 static void
-sqlite_deparse_param(Param *node, deparse_expr_cxt *context)
+deparse_param__(Param *node, DeparseExprCxt__ *context)
 {
 	if (context->params_list)
 	{
@@ -555,11 +560,11 @@ sqlite_deparse_param(Param *node, deparse_expr_cxt *context)
 			*context->params_list = lappend(*context->params_list, node);
 		}
 
-		sqlite_print_remote_param(pindex, node->paramtype, node->paramtypmod, context);
+		print_remoteParam__(pindex, context);
 	}
 	else
 	{
-		sqlite_print_remote_placeholder(node->paramtype, node->paramtypmod, context);
+		print_remotePlaceholder__(context);
 	}
 }
 
@@ -568,7 +573,7 @@ sqlite_deparse_param(Param *node, deparse_expr_cxt *context)
  * Deparse a function call.
  */
 static void
-sqlite_deparse_func_expr(FuncExpr *node, deparse_expr_cxt *context)
+deparse_funcExpr__(FuncExpr *node, DeparseExprCxt__ *context)
 {
 	StringInfo     buf = context->buf;
 	HeapTuple      proctup;
@@ -586,7 +591,7 @@ sqlite_deparse_func_expr(FuncExpr *node, deparse_expr_cxt *context)
 	procform = (Form_pg_proc) GETSTRUCT(proctup);
 
 	/* Translate PostgreSQL function into mysql function */
-	proname = sqlite_replace_function(NameStr(procform->proname));
+	proname = replace_function__(NameStr(procform->proname));
 
 	/* Deparse the function name ... */
 	appendStringInfo(buf, "%s(", proname);
@@ -597,7 +602,7 @@ sqlite_deparse_func_expr(FuncExpr *node, deparse_expr_cxt *context)
 	{
 		if (!first)
 			appendStringInfoString(buf, ", ");
-		deparseExpr((Expr *) lfirst(arg), context);
+		deparse_expr__((Expr *) lfirst(arg), context);
 		first = false;
 	}
 	appendStringInfoChar(buf, ')');
@@ -609,7 +614,7 @@ sqlite_deparse_func_expr(FuncExpr *node, deparse_expr_cxt *context)
  * Deparse an array subscript expression.
  */
 static void
-sqlite_deparse_array_ref(ArrayRef *node, deparse_expr_cxt *context)
+deparse_arrayRef__(ArrayRef *node, DeparseExprCxt__ *context)
 {
 	StringInfo	buf = context->buf;
 	ListCell   *lowlist_item;
@@ -625,11 +630,11 @@ sqlite_deparse_array_ref(ArrayRef *node, deparse_expr_cxt *context)
 	 * case of subscripting a Var, but otherwise do it.
 	 */
 	if (IsA(node->refexpr, Var))
-		deparseExpr(node->refexpr, context);
+		deparse_expr__(node->refexpr, context);
 	else
 	{
 		appendStringInfoChar(buf, '(');
-		deparseExpr(node->refexpr, context);
+		deparse_expr__(node->refexpr, context);
 		appendStringInfoChar(buf, ')');
 	}
 
@@ -640,11 +645,11 @@ sqlite_deparse_array_ref(ArrayRef *node, deparse_expr_cxt *context)
 		appendStringInfoChar(buf, '[');
 		if (lowlist_item)
 		{
-			deparseExpr(lfirst(lowlist_item), context);
+			deparse_expr__(lfirst(lowlist_item), context);
 			appendStringInfoChar(buf, ':');
 			lowlist_item = lnext(lowlist_item);
 		}
-		deparseExpr(lfirst(uplist_item), context);
+		deparse_expr__(lfirst(uplist_item), context);
 		appendStringInfoChar(buf, ']');
 	}
 
@@ -657,7 +662,7 @@ sqlite_deparse_array_ref(ArrayRef *node, deparse_expr_cxt *context)
  * priority of operations, we always parenthesize the arguments.
  */
 static void
-sqlite_deparse_op_expr(OpExpr *node, deparse_expr_cxt *context)
+deparse_opExpr__(OpExpr *node, DeparseExprCxt__ *context)
 {
 	StringInfo	buf = context->buf;
 	HeapTuple	tuple;
@@ -684,19 +689,19 @@ sqlite_deparse_op_expr(OpExpr *node, deparse_expr_cxt *context)
 	if (oprkind == 'r' || oprkind == 'b')
 	{
 		arg = list_head(node->args);
-		deparseExpr(lfirst(arg), context);
+		deparse_expr__(lfirst(arg), context);
 		appendStringInfoChar(buf, ' ');
 	}
 
 	/* Deparse operator name. */
-	sqlite_deparse_operator_name(buf, form);
+	deparse_operatorName__(buf, form);
 
 	/* Deparse right operand. */
 	if (oprkind == 'l' || oprkind == 'b')
 	{
 		arg = list_tail(node->args);
 		appendStringInfoChar(buf, ' ');
-		deparseExpr(lfirst(arg), context);
+		deparse_expr__(lfirst(arg), context);
 	}
 
 	appendStringInfoChar(buf, ')');
@@ -709,16 +714,16 @@ sqlite_deparse_op_expr(OpExpr *node, deparse_expr_cxt *context)
  * Deparse IS DISTINCT FROM.
  */
 static void
-sqlite_deparse_distinct_expr(DistinctExpr *node, deparse_expr_cxt *context)
+deparse_distinctExpr__(DistinctExpr *node, DeparseExprCxt__ *context)
 {
 	StringInfo	buf = context->buf;
 
 	Assert(list_length(node->args) == 2);
 
 	appendStringInfoChar(buf, '(');
-	deparseExpr(linitial(node->args), context);
+	deparse_expr__(linitial(node->args), context);
 	appendStringInfoString(buf, " IS DISTINCT FROM ");
-	deparseExpr(lsecond(node->args), context);
+	deparse_expr__(lsecond(node->args), context);
 	appendStringInfoChar(buf, ')');
 }
 
@@ -728,7 +733,7 @@ sqlite_deparse_distinct_expr(DistinctExpr *node, deparse_expr_cxt *context)
  * around priority of operations, we always parenthesize the arguments.
  */
 static void
-sqlite_deparse_scalar_array_op_expr(ScalarArrayOpExpr *node, deparse_expr_cxt *context)
+deparse_scalarArrayOpExpr__(ScalarArrayOpExpr *node, DeparseExprCxt__ *context)
 {
 	StringInfo        buf = context->buf;
 	HeapTuple         tuple;
@@ -751,7 +756,7 @@ sqlite_deparse_scalar_array_op_expr(ScalarArrayOpExpr *node, deparse_expr_cxt *c
 
 	/* Deparse left operand. */
 	arg1 = linitial(node->args);
-	deparseExpr(arg1, context);
+	deparse_expr__(arg1, context);
 	appendStringInfoChar(buf, ' ');
 
 	opname = NameStr(form->oprname);
@@ -778,10 +783,10 @@ sqlite_deparse_scalar_array_op_expr(ScalarArrayOpExpr *node, deparse_expr_cxt *c
 				{
 					case INT4ARRAYOID:
 					case OIDARRAYOID:
-						sqlite_deparse_string(buf, extval, false);
+						deparse_string__(buf, extval, false);
 						break;
 					default:
-						sqlite_deparse_string(buf, extval, true);
+						deparse_string__(buf, extval, true);
 						break;
 				}
 			}
@@ -793,7 +798,7 @@ sqlite_deparse_scalar_array_op_expr(ScalarArrayOpExpr *node, deparse_expr_cxt *c
 		}
 		break;
 		default:
-			deparseExpr(arg2, context);
+			deparse_expr__(arg2, context);
 			break;
 	}
 	appendStringInfoChar(buf, ')');
@@ -805,9 +810,9 @@ sqlite_deparse_scalar_array_op_expr(ScalarArrayOpExpr *node, deparse_expr_cxt *c
  * Deparse a RelabelType (binary-compatible cast) node.
  */
 static void
-sqlite_deparse_relabel_type(RelabelType *node, deparse_expr_cxt *context)
+deparse_relabelType__(RelabelType *node, DeparseExprCxt__ *context)
 {
-	deparseExpr(node->arg, context);
+	deparse_expr__(node->arg, context);
 }
 
 
@@ -818,7 +823,7 @@ sqlite_deparse_relabel_type(RelabelType *node, deparse_expr_cxt *context)
  * into N-argument form, so we'd better be prepared to deal with that.
  */
 static void
-sqlite_deparse_bool_expr(BoolExpr *node, deparse_expr_cxt *context)
+deparse_boolExpr__(BoolExpr *node, DeparseExprCxt__ *context)
 {
 	StringInfo	buf = context->buf;
 	const char *op = NULL;		/* keep compiler quiet */
@@ -835,7 +840,7 @@ sqlite_deparse_bool_expr(BoolExpr *node, deparse_expr_cxt *context)
 			break;
 		case NOT_EXPR:
 			appendStringInfoString(buf, "(NOT ");
-			deparseExpr(linitial(node->args), context);
+			deparse_expr__(linitial(node->args), context);
 			appendStringInfoChar(buf, ')');
 			return;
 	}
@@ -846,7 +851,7 @@ sqlite_deparse_bool_expr(BoolExpr *node, deparse_expr_cxt *context)
 	{
 		if (!first)
 			appendStringInfo(buf, " %s ", op);
-		deparseExpr((Expr *) lfirst(lc), context);
+		deparse_expr__((Expr *) lfirst(lc), context);
 		first = false;
 	}
 	appendStringInfoChar(buf, ')');
@@ -857,12 +862,12 @@ sqlite_deparse_bool_expr(BoolExpr *node, deparse_expr_cxt *context)
  * Deparse IS [NOT] NULL expression.
  */
 static void
-sqlite_deparse_null_test(NullTest *node, deparse_expr_cxt *context)
+deparse_nullTest__(NullTest *node, DeparseExprCxt__ *context)
 {
 	StringInfo	buf = context->buf;
 
 	appendStringInfoChar(buf, '(');
-	deparseExpr(node->arg, context);
+	deparse_expr__(node->arg, context);
 	if (node->nulltesttype == IS_NULL)
 		appendStringInfoString(buf, " IS NULL)");
 	else
@@ -874,7 +879,7 @@ sqlite_deparse_null_test(NullTest *node, deparse_expr_cxt *context)
  * Deparse ARRAY[...] construct.
  */
 static void
-sqlite_deparse_array_expr(ArrayExpr *node, deparse_expr_cxt *context)
+deparse_arrayExpr__(ArrayExpr *node, DeparseExprCxt__ *context)
 {
 	StringInfo	buf = context->buf;
 	bool		first = true;
@@ -885,7 +890,7 @@ sqlite_deparse_array_expr(ArrayExpr *node, deparse_expr_cxt *context)
 	{
 		if (!first)
 			appendStringInfoString(buf, ", ");
-		deparseExpr(lfirst(lc), context);
+		deparse_expr__(lfirst(lc), context);
 		first = false;
 	}
 	appendStringInfoChar(buf, ']');
@@ -893,24 +898,17 @@ sqlite_deparse_array_expr(ArrayExpr *node, deparse_expr_cxt *context)
 
 
 /*
- * Print the representation of a parameter to be sent to the remote side.
- *
- * Note: we always label the Param's type explicitly rather than relying on
- * transmitting a numeric type OID in PQexecParams().  This allows us to
- * avoid assuming that types have the same OIDs on the remote side as they
- * do locally --- they need only have the same names.
+ * Print the representation of a parameter to be sent to sqlite.
  */
 static void
-sqlite_print_remote_param(int paramindex, Oid paramtype, int32 paramtypmod,
-				 deparse_expr_cxt *context)
+print_remoteParam__(int paramindex, DeparseExprCxt__ *context)
 {
 	appendStringInfo(context->buf, "?%d", paramindex);
 }
 
     
 static void
-sqlite_print_remote_placeholder(Oid paramtype, int32 paramtypmod,
-					   deparse_expr_cxt *context)
+print_remotePlaceholder__(DeparseExprCxt__ *context)
 {
 	StringInfo	buf = context->buf;
 	appendStringInfo(buf, "(SELECT null)");
@@ -976,7 +974,7 @@ do { \
 * Append a SQL string literal representing "val" to buf.
 */
 static void
-sqlite_deparse_string_literal(StringInfo buf, const char *val)
+deparse_stringLiteral__(StringInfo buf, const char *val)
 {
 	const char *valptr;
 	appendStringInfoChar(buf, '\'');
@@ -996,7 +994,7 @@ sqlite_deparse_string_literal(StringInfo buf, const char *val)
  * mysql differ, so return the mysql equelent function name
  */
 static char*
-sqlite_replace_function(char *in)
+replace_function__(char *in)
 {
 	if (strcmp(in, "btrim") == 0)
 	{
@@ -1010,7 +1008,7 @@ sqlite_replace_function(char *in)
  * Print the name of an operator.
  */
 static void
-sqlite_deparse_operator_name(StringInfo buf, Form_pg_operator opform)
+deparse_operatorName__(StringInfo buf, Form_pg_operator opform)
 {
 	/* opname is not a SQL identifier, so we should not quote it. */
 	cur_opname = NameStr(opform->oprname);
@@ -1023,7 +1021,7 @@ sqlite_deparse_operator_name(StringInfo buf, Form_pg_operator opform)
 		opnspname = get_namespace_name(opform->oprnamespace);
 		/* Print fully qualified operator name. */
 		appendStringInfo(buf, "OPERATOR(%s.%s)",
-						 sqlite_quote_identifier(opnspname, '`'), cur_opname);
+						 quote_identifier__(opnspname, '`'), cur_opname);
 	}
 	else
 	{
@@ -1068,7 +1066,7 @@ sqlite_deparse_operator_name(StringInfo buf, Form_pg_operator opform)
 
     
 static void
-sqlite_deparse_string(StringInfo buf, const char *val, bool isstr)
+deparse_string__(StringInfo buf, const char *val, bool isstr)
 {
 	const char *valptr;
 	int i = -1;
@@ -1106,22 +1104,22 @@ sqlite_deparse_string(StringInfo buf, const char *val, bool isstr)
  * Returns true if given expr is safe to evaluate on the foreign server.
  */
 bool
-is_foreign_expr(PlannerInfo *root,
+is_foreignExpr(PlannerInfo *root,
                 RelOptInfo *baserel,
                 Expr *expr)
 {
-    foreign_glob_cxt glob_cxt;
-    foreign_loc_cxt loc_cxt;
+    GlobalCxt__ glob_cxt;
+    LocalCxt__ loc_cxt;
 
     /*
-     * Check that the expression consists of nodes that are safe to execute
-     * remotely.
+     * Check that the expression consists of nodes that are safe to 
+     * execute remotely.
      */
     glob_cxt.root = root;
     glob_cxt.foreignrel = baserel;
     loc_cxt.collation = InvalidOid;
     loc_cxt.state = FDW_COLLATE_NONE;
-    if (!foreign_expr_walker((Node *) expr, &glob_cxt, &loc_cxt))
+    if (!walk_foreignExpr__((Node *) expr, &glob_cxt, &loc_cxt))
             return false;
 
     /* Expressions examined here should be boolean, ie noncollatable */
@@ -1146,12 +1144,12 @@ is_foreign_expr(PlannerInfo *root,
  * can assume here that the given expression is valid.
  */
 static bool
-foreign_expr_walker(Node *node,
-					foreign_glob_cxt *glob_cxt,
-					foreign_loc_cxt *outer_cxt)
+walk_foreignExpr__(Node *node,
+				   GlobalCxt__ *glob_cxt,
+				   LocalCxt__ *outer_cxt)
 {
 	bool		check_type = true;
-	foreign_loc_cxt inner_cxt;
+	LocalCxt__  inner_cxt;
 	Oid			collation;
 	FDWCollateState state;
 
@@ -1242,13 +1240,13 @@ foreign_expr_walker(Node *node,
 				 * subscripts must yield (noncollatable) integers, they won't
 				 * affect the inner_cxt state.
 				 */
-				if (!foreign_expr_walker((Node *) ar->refupperindexpr,
+				if (!walk_foreignExpr__((Node *) ar->refupperindexpr,
 										 glob_cxt, &inner_cxt))
 					return false;
-				if (!foreign_expr_walker((Node *) ar->reflowerindexpr,
+				if (!walk_foreignExpr__((Node *) ar->reflowerindexpr,
 										 glob_cxt, &inner_cxt))
 					return false;
-				if (!foreign_expr_walker((Node *) ar->refexpr,
+				if (!walk_foreignExpr__((Node *) ar->refexpr,
 										 glob_cxt, &inner_cxt))
 					return false;
 
@@ -1281,7 +1279,7 @@ foreign_expr_walker(Node *node,
 				/*
 				 * Recurse to input subexpressions.
 				 */
-				if (!foreign_expr_walker((Node *) fe->args,
+				if (!walk_foreignExpr__((Node *) fe->args,
 										 glob_cxt, &inner_cxt))
 					return false;
 
@@ -1327,7 +1325,7 @@ foreign_expr_walker(Node *node,
 				/*
 				 * Recurse to input subexpressions.
 				 */
-				if (!foreign_expr_walker((Node *) oe->args,
+				if (!walk_foreignExpr__((Node *) oe->args,
 										 glob_cxt, &inner_cxt))
 					return false;
 
@@ -1365,7 +1363,7 @@ foreign_expr_walker(Node *node,
 				/*
 				 * Recurse to input subexpressions.
 				 */
-				if (!foreign_expr_walker((Node *) oe->args,
+				if (!walk_foreignExpr__((Node *) oe->args,
 										 glob_cxt, &inner_cxt))
 					return false;
 
@@ -1391,7 +1389,7 @@ foreign_expr_walker(Node *node,
 				/*
 				 * Recurse to input subexpression.
 				 */
-				if (!foreign_expr_walker((Node *) r->arg,
+				if (!walk_foreignExpr__((Node *) r->arg,
 										 glob_cxt, &inner_cxt))
 					return false;
 
@@ -1416,7 +1414,7 @@ foreign_expr_walker(Node *node,
 				/*
 				 * Recurse to input subexpressions.
 				 */
-				if (!foreign_expr_walker((Node *) b->args,
+				if (!walk_foreignExpr__((Node *) b->args,
 										 glob_cxt, &inner_cxt))
 					return false;
 
@@ -1432,7 +1430,7 @@ foreign_expr_walker(Node *node,
 				/*
 				 * Recurse to input subexpressions.
 				 */
-				if (!foreign_expr_walker((Node *) nt->arg,
+				if (!walk_foreignExpr__((Node *) nt->arg,
 										 glob_cxt, &inner_cxt))
 					return false;
 
@@ -1448,7 +1446,7 @@ foreign_expr_walker(Node *node,
 				/*
 				 * Recurse to input subexpressions.
 				 */
-				if (!foreign_expr_walker((Node *) a->elements,
+				if (!walk_foreignExpr__((Node *) a->elements,
 										 glob_cxt, &inner_cxt))
 					return false;
 
@@ -1476,7 +1474,7 @@ foreign_expr_walker(Node *node,
 				 */
 				foreach(lc, l)
 				{
-					if (!foreign_expr_walker((Node *) lfirst(lc),
+					if (!walk_foreignExpr__((Node *) lfirst(lc),
 											 glob_cxt, &inner_cxt))
 						return false;
 				}

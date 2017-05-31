@@ -146,7 +146,7 @@ static List *sqliteImportForeignSchema(ImportForeignSchemaStmt *stmt,
  * Helper functions
  */
 static bool sqliteIsValidOption(const char *option, Oid context);
-static int GetEstimatedRows(char const * filename, char * sql);
+static int GetEstimatedRows(sqlite3 *db, char * sql);
 static bool file_exists(const char *name);
 
 
@@ -182,8 +182,10 @@ static struct SQLiteFdwOption valid_options[] =
 
 typedef struct SqliteFdwRelationInfo
 {
-    // Filename and tablename
+    // Filename (i.e. sqlite database and tablename)
     SqliteTableSource src;
+
+    sqlite3 *db;
 	
     /* baserestrictinfo clauses, broken down into safe/unsafe */
 	List	   *remote_conds;
@@ -210,9 +212,13 @@ typedef struct SqliteFdwExecutionState
 
 
 static void sqlite_bind_param_values(SqliteFdwExecutionState *festate,
-        List *fdw_exprs, ForeignScanState * node);
+                                     List *fdw_exprs, 
+                                     ForeignScanState * node);
 static void sqlite_bind_param_value(SqliteFdwExecutionState *festate,
-        int index, Oid ptype, Datum pval, bool isNull);
+                                    int index, 
+                                    Oid ptype, 
+                                    Datum pval, 
+                                    bool isNull);
 static void cleanup_(SqliteFdwExecutionState *);
 
 
@@ -357,10 +363,6 @@ sqliteIsValidOption(const char *option, Oid context)
 	return false;
 }
 
-/*
- * Fetch the options for a mysql_fdw foreign table.
- */
-
 
 static void
 sqliteGetForeignRelSize(PlannerInfo *root,
@@ -414,7 +416,9 @@ sqliteGetForeignRelSize(PlannerInfo *root,
         append_whereClause(&sql, root, baserel, fpinfo->remote_conds,
 						           true, &params_list);
 
-	baserel->rows = GetEstimatedRows(fpinfo->src.database, sql.data);
+	/* Connect to the server */
+	fpinfo->db = get_sqliteDbHandle(fpinfo->src.database);
+	baserel->rows = GetEstimatedRows(fpinfo->db, sql.data);
     baserel->tuples = baserel->rows;
 }
 
@@ -425,25 +429,20 @@ sqliteGetForeignRelSize(PlannerInfo *root,
  *   sqlite3 distribution.
  */
 static int
-GetEstimatedRows(char const * filename, char * sql)
+GetEstimatedRows(sqlite3 *db, char * sql)
 {
-	sqlite3		   *db;
 	sqlite3_stmt   *stmt;
 	const char	   *pzTail;
     double          estimate = 0;
     
     elog(SQLITE_FDW_LOG_LEVEL, "entering function GetEstimatedRows");
 
-	/* Connect to the server */
-	db = get_sqliteDbHandle(filename);
 	stmt = prepare_sqliteQuery(db, sql, &pzTail);
-    
     sqlite3_stmt_scanstatus_reset(stmt);
     if ( sqlite3_stmt_scanstatus(stmt, 0, SQLITE_SCANSTAT_EST, &estimate ) != 
             SQLITE_OK ) 
     {
 	    sqlite3_finalize(stmt);
-	    sqlite3_close(db);
 		ereport(ERROR,
 			(errcode(ERRCODE_FDW_TABLE_NOT_FOUND),
 			errmsg("Could not run sqlite_stmt_scanstatus")
@@ -451,8 +450,6 @@ GetEstimatedRows(char const * filename, char * sql)
     }
 
 	sqlite3_finalize(stmt);
-	sqlite3_close(db);
-
 	return (int) estimate;
 }
 
@@ -481,16 +478,14 @@ sqliteGetForeignPaths(PlannerInfo *root,
 									 NIL));		/* no fdw_private data */
 }
 
-
-
 static ForeignScan *
 sqliteGetForeignPlan(PlannerInfo *root,
-					RelOptInfo *baserel,
-					Oid foreigntableid,
-					ForeignPath *best_path,
-					List *tlist,
-					List *scan_clauses,
-					Plan *outer_plan)
+					 RelOptInfo *baserel,
+					 Oid foreigntableid,
+					 ForeignPath *best_path,
+					 List *tlist,
+					 List *scan_clauses,
+					 Plan *outer_plan)
 {
 	SqliteFdwRelationInfo *fpinfo = (SqliteFdwRelationInfo *) 
                                      baserel->fdw_private;
@@ -501,7 +496,6 @@ sqliteGetForeignPlan(PlannerInfo *root,
 	List        *params_list = NULL;
 	List        *remote_conds = NIL;
 	StringInfoData sql;
-	SqliteTableSource   options = fpinfo->src;
 	List           *retrieved_attrs;
 	ListCell       *lc;
 
@@ -534,26 +528,20 @@ sqliteGetForeignPlan(PlannerInfo *root,
 		if (rinfo->pseudoconstant)
 			continue;
 
-		if (list_member_ptr(fpinfo->remote_conds, rinfo))
+		if ( list_member_ptr(fpinfo->remote_conds, rinfo) ||
+             is_foreignExpr(root, baserel, rinfo->clause) )
 		{
 			remote_conds = lappend(remote_conds, rinfo);
 			remote_exprs = lappend(remote_exprs, rinfo->clause);
 		}
-		else if (list_member_ptr(fpinfo->local_conds, rinfo))
-			local_exprs = lappend(local_exprs, rinfo->clause);
-		else if (is_foreignExpr(root, baserel, rinfo->clause))
-		{
-			remote_conds = lappend(remote_conds, rinfo);
-			remote_exprs = lappend(remote_exprs, rinfo->clause);
-		}
-		else
+        else
 			local_exprs = lappend(local_exprs, rinfo->clause);
 	}
 	
     /* Build the query */
 	initStringInfo(&sql);
     deparse_selectStmt(&sql, root, baserel, fpinfo->attrs_used, 
-                          options.table, &retrieved_attrs);
+                          fpinfo->src.table, &retrieved_attrs);
 
 	if (remote_conds)
 		append_whereClause(&sql, root, baserel, remote_conds,
@@ -568,7 +556,7 @@ sqliteGetForeignPlan(PlannerInfo *root,
     /*   The sql query and the attributes are salted away
      *   Will be used later in BeginForeignScan
      */
-	fdw_private = list_make2(makeString(sql.data), retrieved_attrs);
+	fdw_private = list_make3(makeString(sql.data), retrieved_attrs, fpinfo);
 
 	/*
 	 * Create the ForeignScan node from target list, local filtering
@@ -613,8 +601,9 @@ sqliteBeginForeignScan(ForeignScanState *node,
 	 *
 	 */
 	SqliteFdwExecutionState  *festate;
-    SqliteTableSource        src;
-	ForeignScan       *fsplan = (ForeignScan *) node->ss.ps.plan;
+	ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
+    SqliteFdwRelationInfo *fpinfo = (SqliteFdwRelationInfo *)
+                                    list_nth(fsplan->fdw_private, 2);
 
 	elog(SQLITE_FDW_LOG_LEVEL, "entering function %s", __func__);
 	
@@ -625,17 +614,20 @@ sqliteBeginForeignScan(ForeignScanState *node,
                     palloc0(sizeof(SqliteFdwExecutionState));
 	node->fdw_state = (void *) festate;
 
-	/* Fetch options and then connect  */
-	src = get_tableSource(
-            RelationGetRelid(node->ss.ss_currentRelation));
-	festate->db = get_sqliteDbHandle(src.database);
-	
+    festate->db = fpinfo->db;
     festate->query = strVal(list_nth(fsplan->fdw_private, 0));
-	festate->retrieved_attrs = list_nth(fsplan->fdw_private, 1);
-    festate->stmt = prepare_sqliteQuery(festate->db, festate->query, NULL);
-
-    if ( list_length(fsplan->fdw_exprs) > 0 )
-        sqlite_bind_param_values(festate, fsplan->fdw_exprs, node);
+    festate->retrieved_attrs = list_nth(fsplan->fdw_private, 1);
+    PG_TRY();
+    {
+        festate->stmt = prepare_sqliteQuery(festate->db, festate->query, NULL);
+        if ( list_length(fsplan->fdw_exprs) > 0 )
+            sqlite_bind_param_values(festate, fsplan->fdw_exprs, node);
+    }
+    PG_CATCH();
+    {
+        cleanup_(festate);
+    }
+    PG_END_TRY();
 }
 
 
@@ -666,13 +658,12 @@ sqliteIterateForeignScan(ForeignScanState *node)
 	 * (just as you would need to do in the case of a data type mismatch).
 	 */
 	SqliteFdwExecutionState   *festate = (SqliteFdwExecutionState *) 
-                                         node->fdw_state;
+                                          node->fdw_state;
 	TupleTableSlot  *tupleSlot = node->ss.ss_ScanTupleSlot;
 	TupleDesc       tupleDescriptor = tupleSlot->tts_tupleDescriptor;
 	int             attid = 0;
 	ListCell        *lc = NULL;
 	int             rc = 0;
-    bool            isnull;
 
 	memset (tupleSlot->tts_values, 0, sizeof(Datum) * tupleDescriptor->natts);
 	memset (tupleSlot->tts_isnull, true, sizeof(bool) * tupleDescriptor->natts);
@@ -687,8 +678,8 @@ sqliteIterateForeignScan(ForeignScanState *node)
 			int attnum = lfirst_int(lc) - 1;
 			Oid pgtype = tupleDescriptor->attrs[attnum]->atttypid;
             tupleSlot->tts_values[attnum] = 
-                    make_datum(festate->stmt, attid, pgtype, &isnull);
-            tupleSlot->tts_isnull[attnum] = isnull;
+                    make_datum(festate->stmt, attid, pgtype, 
+                               tupleSlot->tts_isnull + attnum);
 			attid++;
 		}
 		ExecStoreVirtualTuple(tupleSlot);
@@ -1229,6 +1220,8 @@ sqlite_bind_param_value(SqliteFdwExecutionState *festate,
                         bool isNull)
 {
     int rc;
+	Oid   typoutput;
+	bool  typIsVarlena;
     sqlite3_stmt *stmt = festate->stmt;
     
     if ( isNull ) 
@@ -1248,17 +1241,39 @@ sqlite_bind_param_value(SqliteFdwExecutionState *festate,
                 rc = sqlite3_bind_int64(stmt, index, DatumGetInt64(pval));
                 break;
 
+            case FLOAT4OID:
+                rc = sqlite3_bind_double(stmt, index, DatumGetFloat4(pval));
+                break;
+
+            case FLOAT8OID:
+                rc = sqlite3_bind_double(stmt, index, DatumGetFloat8(pval));
+                break;
+
+            case BOOLOID:
+                rc = sqlite3_bind_int(stmt, index, DatumGetBool(pval) ? 1 : 0);
+                break;
+
+            case BYTEAOID:
+                rc = sqlite3_bind_blob(
+                        stmt, index, 
+                        VARDATA(DatumGetPointer(pval)),
+                        VARSIZE(DatumGetPointer(pval)), SQLITE_TRANSIENT);
+                break;
+
             default:
-                rc = SQLITE_OK;
+	            getTypeOutputInfo(ptype, &typoutput, &typIsVarlena);
+                rc = sqlite3_bind_text(
+                            stmt, index, 
+                            OidOutputFunctionCall(typoutput, pval), 
+                            -1, SQLITE_TRANSIENT);
                 break;
         }
 
     if ( rc != SQLITE_OK ) {
-        char const * errmsg_from_sqlite3 = pstrdup(sqlite3_errmsg(festate->db));
-        cleanup_(festate);
         ereport(ERROR,
             (errcode(ERRCODE_FDW_ERROR),
-            errmsg("error while trying to bind param \"%s\"", errmsg_from_sqlite3)
+            errmsg("error while trying to bind param \"%s\"", 
+                        sqlite3_errmsg(festate->db))
             ));
     }
 }
@@ -1274,9 +1289,5 @@ cleanup_(SqliteFdwExecutionState *festate)
     if ( festate->db ) {
         sqlite3_close(festate->db);
         festate->stmt = NULL;
-    }
-    if ( festate->query ) {
-        pfree(festate->query);
-        festate->query = NULL;
     }
 }

@@ -69,16 +69,13 @@ typedef struct LocalCxt__
 
 static char *quote_identifier__(const char *s, char q);
 
-static void deparse_columnRef__(StringInfo buf, 
-        int varno, 
-        int varattno, 
-        PlannerInfo *root);
-static void deparse_targetList__(StringInfo buf, 
-        PlannerInfo *root, 
-        Index rtindex,
-        Relation rel, 
-        Bitmapset *attrs_used, 
-        List **retrieved_attrs);
+static void deparse_columnRef__(StringInfo buf, int varno, int varattno, 
+                                PlannerInfo *root);
+static void deparse_targetList__(StringInfo buf, PlannerInfo *root, 
+                                 Index rtindex,
+                                 Relation rel, 
+                                 Bitmapset *attrs_used, 
+                                 List **retrieved_attrs);
 static void deparse_relaltion__(StringInfo buf, Relation rel);
 static void deparse_interval(StringInfo buf, Datum datum);
 static void deparse_expr__(Expr *expr, DeparseExprCxt__ *context);
@@ -91,22 +88,17 @@ static void deparse_funcExpr__(FuncExpr *, DeparseExprCxt__ *);
 static void deparse_arrayRef__(ArrayRef *, DeparseExprCxt__ *);
 static void deparse_opExpr__(OpExpr *, DeparseExprCxt__ *);
 static void deparse_distinctExpr__(DistinctExpr *, DeparseExprCxt__ *);
-static void deparse_scalarArrayOpExpr__(ScalarArrayOpExpr *,
-						                DeparseExprCxt__ *);
+static void deparse_scalarArrayOpExpr__(ScalarArrayOpExpr *, DeparseExprCxt__ *);
 static void deparse_relabelType__(RelabelType *, DeparseExprCxt__ *);
 static void deparse_arrayExpr__(ArrayExpr *, DeparseExprCxt__ *);
-static void print_remoteParam__(int paramindex, 
-                                DeparseExprCxt__ *context);
+static void print_remoteParam__(int paramindex, DeparseExprCxt__ *context);
 static void print_remotePlaceholder__(DeparseExprCxt__ *context);
 static void deparse_stringLiteral__(StringInfo buf, const char *val);
 static char* replace_function__(char *in);
-static void deparse_operatorName__(StringInfo buf, 
-                                   Form_pg_operator opform);
-static void deparse_string__(StringInfo buf, 
-                             const char *val, 
+static void deparse_operatorName__(StringInfo buf, Form_pg_operator opform);
+static void deparse_string__(StringInfo buf, const char *val, 
                              bool isstr);
-static bool walk_foreignExpr__(Node *node, 
-                               GlobalCxt__ *glob_cxt, 
+static bool walk_foreignExpr__(Node *node, GlobalCxt__ *glob_cxt, 
                                LocalCxt__ *outer_cxt);
 static bool is_builtin(Oid oid);
 

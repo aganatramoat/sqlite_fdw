@@ -15,18 +15,12 @@
 #include "funcs.h"
 
 
-static char const * translate_sqliteType__(
-    char const * type);
-static char const * get_affinity__(
-    char const * type);
-static void add_columnDefinition__(
-    StringInfoData *cftsql,
-    int counter,
-    SqliteTableImportOptions importOpts,
-    sqlite3_stmt *columns);
-static char * convert_blobToHex__(
-    const void * blob, 
-    int len);
+static char const * translate_sqliteType__(char const * type);
+static char const * get_affinity__(char const * type);
+static void add_columnDefinition__(StringInfoData *cftsql, int counter,
+                                   SqliteTableImportOptions importOpts,
+                                   sqlite3_stmt *columns);
+static char * convert_blobToHex__(const void * blob, int len);
 
 
 /*
@@ -151,7 +145,7 @@ prepare_sqliteQuery(sqlite3 *db, char *query, const char **pzTail)
     sqlite3_stmt *stmt;
     
     elog(SQLITE_FDW_LOG_LEVEL, 
-         "entering function sqlitePrepare with \n%s", query);
+         "entering function prepare_sqliteQuery with \n%s", query);
 
 	/* Execute the query */
 	if ( sqlite3_prepare_v2(db, query, -1, &stmt, pzTail) != 
@@ -306,26 +300,25 @@ add_columnDefinition__(StringInfoData *cftsql,
     char *typename = sqlite3_column_type(columns, 2) ==
                          SQLITE_NULL ? "blob" :
                          (char *) sqlite3_column_text(columns, 2);
+    char const *pgtypename = translate_sqliteType__(typename);
 
     if ( counter > 0 )
         appendStringInfo(cftsql, ",");
     appendStringInfo(cftsql, "\n");
         
     appendStringInfo(cftsql, "%s ", quote_identifier(colname));
-    appendStringInfo(cftsql, "%s ",
-            translate_sqliteType__(typename));
+    appendStringInfo(cftsql, "%s ", pgtypename);
     
-    // the third column is 1 if column is specified to
-    // be not null in sqlite 
+    // the third column is 1 if column is not null in sqlite schema
     if ( importOpts.import_notnull )
         if ( sqlite3_column_int(columns, 3) == 1 )
             appendStringInfo(cftsql, " NOT NULL ");
 
     if ( importOpts.import_default )
         if ( sqlite3_column_type(columns, 4 ) != SQLITE_NULL )
-            appendStringInfo(cftsql, 
-                    " DEFAULT %s ",
-                    (char *) sqlite3_column_text(columns, 4));
+            appendStringInfo(cftsql, " DEFAULT %s::%s ",
+                    (char *) sqlite3_column_text(columns, 4),
+                    pgtypename);
 }
 
 

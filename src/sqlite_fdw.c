@@ -200,20 +200,20 @@ typedef struct SqliteFdwRelationInfo
  * FDW-specific information for ForeignScanState.fdw_state.
  */
 
-typedef struct SQLiteFdwExecutionState
+typedef struct SqliteFdwExecutionState
 {
 	sqlite3       *db;
 	sqlite3_stmt  *stmt;
 	char          *query;
 	List          *retrieved_attrs;   /* list of target attribute numbers */
-} SQLiteFdwExecutionState;
+} SqliteFdwExecutionState;
 
 
-static void sqlite_bind_param_values(SQLiteFdwExecutionState *festate,
+static void sqlite_bind_param_values(SqliteFdwExecutionState *festate,
         List *fdw_exprs, ForeignScanState * node);
-static void sqlite_bind_param_value(SQLiteFdwExecutionState *festate,
+static void sqlite_bind_param_value(SqliteFdwExecutionState *festate,
         int index, Oid ptype, Datum pval, bool isNull);
-static void cleanup_(SQLiteFdwExecutionState *);
+static void cleanup_(SqliteFdwExecutionState *);
 
 
 Datum
@@ -397,8 +397,7 @@ sqliteGetForeignRelSize(PlannerInfo *root,
 			fpinfo->local_conds = lappend(fpinfo->local_conds, ri);
 	}
 	
-    // We will need to fetch the attributes that are needed 
-    // locally by postgres
+    // fetch the attributes that are needed locally by postgres
 	foreach(lc, fpinfo->local_conds)
 	{
 		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
@@ -440,7 +439,8 @@ GetEstimatedRows(char const * filename, char * sql)
 	stmt = prepare_sqliteQuery(db, sql, &pzTail);
     
     sqlite3_stmt_scanstatus_reset(stmt);
-    if ( sqlite3_stmt_scanstatus(stmt, 0, SQLITE_SCANSTAT_EST, &estimate ) != SQLITE_OK ) 
+    if ( sqlite3_stmt_scanstatus(stmt, 0, SQLITE_SCANSTAT_EST, &estimate ) != 
+            SQLITE_OK ) 
     {
 	    sqlite3_finalize(stmt);
 	    sqlite3_close(db);
@@ -505,9 +505,6 @@ sqliteGetForeignPlan(PlannerInfo *root,
 	List           *retrieved_attrs;
 	ListCell       *lc;
 
-    /* Build the query */
-	initStringInfo(&sql);
-	
     /*
 	 * Separate the scan_clauses into those that can be executed remotely and
 	 * those that can't.  baserestrictinfo clauses that were previously
@@ -553,6 +550,8 @@ sqliteGetForeignPlan(PlannerInfo *root,
 			local_exprs = lappend(local_exprs, rinfo->clause);
 	}
 	
+    /* Build the query */
+	initStringInfo(&sql);
     deparse_selectStmt(&sql, root, baserel, fpinfo->attrs_used, 
                           options.table, &retrieved_attrs);
 
@@ -613,7 +612,7 @@ sqliteBeginForeignScan(ForeignScanState *node,
 	 * ExplainForeignScan and EndForeignScan.
 	 *
 	 */
-	SQLiteFdwExecutionState  *festate;
+	SqliteFdwExecutionState  *festate;
     SqliteTableSource        src;
 	ForeignScan       *fsplan = (ForeignScan *) node->ss.ps.plan;
 
@@ -622,8 +621,8 @@ sqliteBeginForeignScan(ForeignScanState *node,
     /*
 	 * We'll save private state in node->fdw_state.
 	 */
-	festate = (SQLiteFdwExecutionState *) 
-                    palloc0(sizeof(SQLiteFdwExecutionState));
+	festate = (SqliteFdwExecutionState *) 
+                    palloc0(sizeof(SqliteFdwExecutionState));
 	node->fdw_state = (void *) festate;
 
 	/* Fetch options and then connect  */
@@ -666,7 +665,7 @@ sqliteIterateForeignScan(ForeignScanState *node)
 	 * that none should be present, it may be appropriate to raise an error
 	 * (just as you would need to do in the case of a data type mismatch).
 	 */
-	SQLiteFdwExecutionState   *festate = (SQLiteFdwExecutionState *) 
+	SqliteFdwExecutionState   *festate = (SqliteFdwExecutionState *) 
                                          node->fdw_state;
 	TupleTableSlot  *tupleSlot = node->ss.ss_ScanTupleSlot;
 	TupleDesc       tupleDescriptor = tupleSlot->tts_tupleDescriptor;
@@ -714,7 +713,7 @@ sqliteReScanForeignScan(ForeignScanState *node)
 static void
 sqliteEndForeignScan(ForeignScanState *node)
 {
-	cleanup_((SQLiteFdwExecutionState *) node->fdw_state);
+	cleanup_((SqliteFdwExecutionState *) node->fdw_state);
 }
 
 
@@ -972,7 +971,7 @@ sqliteExplainForeignScan(ForeignScanState *node,
 	char					   *query;
 	size_t						len;
 	const char				   *pzTail;
-	SQLiteFdwExecutionState	   *festate = (SQLiteFdwExecutionState *) node->fdw_state;
+	SqliteFdwExecutionState	   *festate = (SqliteFdwExecutionState *) node->fdw_state;
     SqliteTableSource          opt;
 
 	elog(SQLITE_FDW_LOG_LEVEL, "entering function %s", __func__);
@@ -1187,8 +1186,7 @@ file_exists(const char *name)
 
 
 void
-sqlite_bind_param_values(SQLiteFdwExecutionState *festate,
-                         List *fdw_exprs, 
+sqlite_bind_param_values(SqliteFdwExecutionState *festate, List *fdw_exprs, 
                          ForeignScanState *node)
 {
 	ListCell   *lc;
@@ -1204,7 +1202,8 @@ sqlite_bind_param_values(SQLiteFdwExecutionState *festate,
     foreach(lc, fdw_exprs)
 		param_types[i++] = exprType((Node *) lfirst(lc));
 
-    oldcontext = MemoryContextSwitchTo(node->ss.ps.ps_ExprContext->ecxt_per_tuple_memory);
+    oldcontext = MemoryContextSwitchTo(
+                    node->ss.ps.ps_ExprContext->ecxt_per_tuple_memory);
 
     i = 0;
     foreach(lc, param_exprs)
@@ -1223,28 +1222,30 @@ sqlite_bind_param_values(SQLiteFdwExecutionState *festate,
 
 
 void
-sqlite_bind_param_value(SQLiteFdwExecutionState *festate,
+sqlite_bind_param_value(SqliteFdwExecutionState *festate,
                         int index, 
                         Oid ptype, 
                         Datum pval, 
                         bool isNull)
 {
     int rc;
+    sqlite3_stmt *stmt = festate->stmt;
+    
     if ( isNull ) 
-        rc = sqlite3_bind_null(festate->stmt, index);
+        rc = sqlite3_bind_null(stmt, index);
     else
         switch(ptype)
         {
             case INT2OID:
-                rc = sqlite3_bind_int(festate->stmt, index, DatumGetInt16(pval));
+                rc = sqlite3_bind_int(stmt, index, DatumGetInt16(pval));
                 break;
             
             case INT4OID:
-                rc = sqlite3_bind_int(festate->stmt, index, DatumGetInt32(pval));
+                rc = sqlite3_bind_int(stmt, index, DatumGetInt32(pval));
                 break;
             
             case INT8OID:
-                rc = sqlite3_bind_int64(festate->stmt, index, DatumGetInt64(pval));
+                rc = sqlite3_bind_int64(stmt, index, DatumGetInt64(pval));
                 break;
 
             default:
@@ -1264,7 +1265,7 @@ sqlite_bind_param_value(SQLiteFdwExecutionState *festate,
 
 
 void
-cleanup_(SQLiteFdwExecutionState *festate)
+cleanup_(SqliteFdwExecutionState *festate)
 {
     if ( festate->stmt ) {
         sqlite3_finalize(festate->stmt);

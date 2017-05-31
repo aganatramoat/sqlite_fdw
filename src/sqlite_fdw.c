@@ -668,12 +668,12 @@ sqliteIterateForeignScan(ForeignScanState *node)
 	 */
 	SQLiteFdwExecutionState   *festate = (SQLiteFdwExecutionState *) 
                                          node->fdw_state;
-	TupleTableSlot      *tupleSlot = node->ss.ss_ScanTupleSlot;
-	TupleDesc           tupleDescriptor = tupleSlot->tts_tupleDescriptor;
-	int                 attid = 0;
-	ListCell            *lc = NULL;
-	int                 rc = 0;
-    bool                isnull;
+	TupleTableSlot  *tupleSlot = node->ss.ss_ScanTupleSlot;
+	TupleDesc       tupleDescriptor = tupleSlot->tts_tupleDescriptor;
+	int             attid = 0;
+	ListCell        *lc = NULL;
+	int             rc = 0;
+    bool            isnull;
 
 	memset (tupleSlot->tts_values, 0, sizeof(Datum) * tupleDescriptor->natts);
 	memset (tupleSlot->tts_isnull, true, sizeof(bool) * tupleDescriptor->natts);

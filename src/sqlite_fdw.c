@@ -485,12 +485,12 @@ sqliteGetForeignPaths(PlannerInfo *root,
 
 static ForeignScan *
 sqliteGetForeignPlan(PlannerInfo *root,
-						RelOptInfo *baserel,
-						Oid foreigntableid,
-						ForeignPath *best_path,
-						List *tlist,
-						List *scan_clauses,
-						Plan *outer_plan)
+					RelOptInfo *baserel,
+					Oid foreigntableid,
+					ForeignPath *best_path,
+					List *tlist,
+					List *scan_clauses,
+					Plan *outer_plan)
 {
 	SqliteFdwRelationInfo *fpinfo = (SqliteFdwRelationInfo *) 
                                      baserel->fdw_private;
@@ -666,34 +666,35 @@ sqliteIterateForeignScan(ForeignScanState *node)
 	 * that none should be present, it may be appropriate to raise an error
 	 * (just as you would need to do in the case of a data type mismatch).
 	 */
+	SQLiteFdwExecutionState   *festate = (SQLiteFdwExecutionState *) 
+                                         node->fdw_state;
+	TupleTableSlot      *tupleSlot = node->ss.ss_ScanTupleSlot;
+	TupleDesc           tupleDescriptor = tupleSlot->tts_tupleDescriptor;
+	int                 attid = 0;
+	ListCell            *lc = NULL;
+	int                 rc = 0;
+    bool                isnull;
 
-	char        **values;
-	HeapTuple   tuple;
-	int         x;
-	SQLiteFdwExecutionState *festate = (SQLiteFdwExecutionState *) 
-                                        node->fdw_state;
-	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
+	memset (tupleSlot->tts_values, 0, sizeof(Datum) * tupleDescriptor->natts);
+	memset (tupleSlot->tts_isnull, true, sizeof(bool) * tupleDescriptor->natts);
+	attid = 0;
+	ExecClearTuple(tupleSlot);
     
-    elog(SQLITE_FDW_LOG_LEVEL, "entering function %s", __func__);
-	ExecClearTuple(slot);
-
-	/* get the next record, if any, and fill in the slot */
-	if (sqlite3_step(festate->stmt) == SQLITE_ROW)
+    rc = sqlite3_step(festate->stmt);
+	if (rc == SQLITE_ROW)
 	{
-		/* Build the tuple */
-		values = (char **) palloc(sizeof(char *) * sqlite3_column_count(festate->stmt));
-
-		for (x = 0; x < sqlite3_column_count(festate->stmt); x++)
+		foreach(lc, festate->retrieved_attrs)
 		{
-			values[x] = (char *) sqlite3_column_text(festate->stmt, x);
+			int attnum = lfirst_int(lc) - 1;
+			Oid pgtype = tupleDescriptor->attrs[attnum]->atttypid;
+            tupleSlot->tts_values[attnum] = 
+                    make_datum(festate->stmt, attid, pgtype, &isnull);
+            tupleSlot->tts_isnull[attnum] = isnull;
+			attid++;
 		}
-
-		tuple = BuildTupleFromCStrings(TupleDescGetAttInMetadata(node->ss.ss_currentRelation->rd_att), values);
-		ExecStoreTuple(tuple, slot, InvalidBuffer, false);
+		ExecStoreVirtualTuple(tupleSlot);
 	}
-
-	/* then return the slot */
-	return slot;
+    return tupleSlot;
 }
 
 
@@ -1152,6 +1153,7 @@ sqliteImportForeignSchema(ImportForeignSchemaStmt *stmt,
 		if (tbls)
 			sqlite3_finalize(tbls);
         sqlite3_close(db);
+        pfree(filename);
 
 		PG_RE_THROW();
 	}
@@ -1159,6 +1161,7 @@ sqliteImportForeignSchema(ImportForeignSchemaStmt *stmt,
 
 	sqlite3_finalize(tbls);
 	sqlite3_close(db);
+    pfree(filename);
 
 	return commands;
 }

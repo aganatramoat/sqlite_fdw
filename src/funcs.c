@@ -6,17 +6,27 @@
 #include <foreign/foreign.h>
 #include <commands/defrem.h>
 #include <utils/lsyscache.h>
+#include <utils/syscache.h>
+#include <catalog/pg_type.h>
+#include <access/htup_details.h>
 #include <sqlite3.h>
 
 #include "sqlite_fdw.h"
 #include "funcs.h"
 
-static char const * translate_sqliteType__(char const * type);
-static char const * get_affinity__(char const * type);
-static void add_columnDefinition__(StringInfoData *cftsql,
-                       int counter,
-                       SqliteTableImportOptions importOpts,
-                       sqlite3_stmt *columns);
+
+static char const * translate_sqliteType__(
+    char const * type);
+static char const * get_affinity__(
+    char const * type);
+static void add_columnDefinition__(
+    StringInfoData *cftsql,
+    int counter,
+    SqliteTableImportOptions importOpts,
+    sqlite3_stmt *columns);
+static char * convert_blobToHex__(
+    const void * blob, 
+    int len);
 
 
 /*
@@ -316,4 +326,122 @@ add_columnDefinition__(StringInfoData *cftsql,
             appendStringInfo(cftsql, 
                     " DEFAULT %s ",
                     (char *) sqlite3_column_text(columns, 4));
+}
+
+
+SqliteTableImportOptions 
+get_sqliteTableImportOptions(ImportForeignSchemaStmt *stmt)
+{
+    ListCell *lc;
+    SqliteTableImportOptions ret;
+
+	foreach(lc, stmt->options)
+	{
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+		if (strcmp(def->defname, "import_default") == 0)
+			ret.import_default = defGetBoolean(def);
+		else if (strcmp(def->defname, "import_not_null") == 0)
+			ret.import_notnull = defGetBoolean(def);
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+					  errmsg("invalid option \"%s\"", def->defname)));
+	}
+
+    return ret;
+}
+
+
+static char *
+convert_blobToHex__(const void * blob, int len)
+{
+    char * result = palloc(len * 2 + 2 + 1);
+    char * rp = result;
+
+    *rp++ = '\\';
+    *rp++ = 'x';
+    rp += hex_encode((const char *) blob, len, rp);
+    *rp = '\0';
+
+    return result;
+}
+
+
+char **
+build_rowStringRepresentation(sqlite3_stmt * stmt)
+{
+    char ** values = (char **) palloc(
+                        sizeof(char *) * 
+                        sqlite3_column_count(stmt));
+    int x;
+    
+    for (x = 0; x < sqlite3_column_count(stmt); x++)
+        switch ( sqlite3_column_type(stmt, x ) )
+        {
+            case SQLITE_INTEGER:
+            case SQLITE_FLOAT:
+            case SQLITE_TEXT:
+                values[x] = (char *) 
+                        sqlite3_column_text(stmt, x);
+                break;
+            case SQLITE_BLOB:
+                values[x] = convert_blobToHex__(
+                    sqlite3_column_blob(stmt, x),
+                    sqlite3_column_bytes(stmt, x));
+                break;
+            default:
+                values[x] = NULL;
+                break;
+        }
+    return values;
+}
+
+
+Datum
+make_datum(sqlite3_stmt *stmt, int col, Oid pgtyp, bool *isnull)
+{
+	Datum valueDatum = 0;
+	regproc typeinput;
+	HeapTuple tuple;
+	int typemod;
+    void * blob = NULL;
+	
+    /* get the type's output function */
+	tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(pgtyp));
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for type%u", pgtyp);
+
+	typeinput = ((Form_pg_type)GETSTRUCT(tuple))->typinput;
+	typemod  = ((Form_pg_type)GETSTRUCT(tuple))->typtypmod;
+	ReleaseSysCache(tuple);
+    
+    *isnull = false;
+    switch ( sqlite3_column_type(stmt, col ) )
+    {
+        case SQLITE_INTEGER:
+        case SQLITE_FLOAT:
+        case SQLITE_TEXT:
+			valueDatum = CStringGetDatum((char*)
+                    sqlite3_column_text(stmt, col));
+            break;
+        case SQLITE_BLOB:
+            blob = palloc(sqlite3_column_bytes(stmt, col) + 
+                          VARHDRSZ);
+            memcpy((char *)blob + VARHDRSZ, 
+                    sqlite3_column_blob(stmt, col), 
+                    sqlite3_column_bytes(stmt, col));
+			SET_VARSIZE(blob, 
+                        sqlite3_column_bytes(stmt, col) + VARHDRSZ);
+			return PointerGetDatum(blob);
+        default:
+            *isnull = true;
+            break;
+    }
+
+    return OidFunctionCall3(
+                typeinput, 
+                valueDatum, 
+                ObjectIdGetDatum(InvalidOid), 
+                Int32GetDatum(typemod));
 }

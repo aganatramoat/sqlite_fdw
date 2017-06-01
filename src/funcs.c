@@ -409,16 +409,17 @@ make_datum(sqlite3_stmt *stmt, int col, Oid pgtyp, bool *isnull)
 	typemod  = ((Form_pg_type)GETSTRUCT(tuple))->typtypmod;
 	ReleaseSysCache(tuple);
     
-    *isnull = false;
     switch ( sqlite3_column_type(stmt, col ) )
     {
         case SQLITE_INTEGER:
         case SQLITE_FLOAT:
         case SQLITE_TEXT:
+            *isnull = false;
 			valueDatum = CStringGetDatum((char*)
                     sqlite3_column_text(stmt, col));
             break;
         case SQLITE_BLOB:
+            *isnull = false;
             blob = palloc(sqlite3_column_bytes(stmt, col) + 
                           VARHDRSZ);
             memcpy((char *)blob + VARHDRSZ, 
@@ -427,9 +428,9 @@ make_datum(sqlite3_stmt *stmt, int col, Oid pgtyp, bool *isnull)
 			SET_VARSIZE(blob, 
                         sqlite3_column_bytes(stmt, col) + VARHDRSZ);
 			return PointerGetDatum(blob);
-        default:
+        case SQLITE_NULL:
             *isnull = true;
-            break;
+            return valueDatum;
     }
 
     return OidFunctionCall3(

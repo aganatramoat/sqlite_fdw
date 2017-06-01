@@ -626,6 +626,7 @@ sqliteBeginForeignScan(ForeignScanState *node,
     PG_CATCH();
     {
         cleanup_(festate);
+		PG_RE_THROW();
     }
     PG_END_TRY();
 }

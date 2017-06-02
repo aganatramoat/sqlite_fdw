@@ -20,7 +20,23 @@ static char const * get_affinity__(char const * type);
 static void add_columnDefinition__(StringInfoData *cftsql, int counter,
                                    SqliteTableImportOptions importOpts,
                                    sqlite3_stmt *columns);
-static char * convert_blobToHex__(const void * blob, int len);
+
+
+typedef struct PgTypeInputTraits__ 
+{
+    regproc   typeinput;
+    int       typmod;
+    bool      valid;
+} PgTypeInputTraits__;
+
+static PgTypeInputTraits__ get_pgTypeInputTraits__(Oid pgtyp);
+static Datum make_datumFloat__(sqlite3_stmt *stmt, int col, Oid pgtyp, 
+                               PgTypeInputTraits__ traits);
+static Datum make_datumInt__(sqlite3_stmt *stmt, int col, Oid pgtyp, 
+                             PgTypeInputTraits__ traits);
+static Datum make_datumViaCString__(sqlite3_stmt *stmt, int col,
+                                    PgTypeInputTraits__ traits);
+
 
 
 /*
@@ -233,7 +249,6 @@ get_foreignTableCreationSql(ImportForeignSchemaStmt *stmt,
     }
     PG_END_TRY();
     
-    pfree(columns_q);
     if ( columns )
         sqlite3_finalize(columns);
     
@@ -346,96 +361,114 @@ get_sqliteTableImportOptions(ImportForeignSchemaStmt *stmt)
 }
 
 
-static char *
-convert_blobToHex__(const void * blob, int len)
+static Datum
+make_datumViaCString__(sqlite3_stmt *stmt, int col, PgTypeInputTraits__ traits)
 {
-    char * result = palloc(len * 2 + 2 + 1);
-    char * rp = result;
-
-    *rp++ = '\\';
-    *rp++ = 'x';
-    rp += hex_encode((const char *) blob, len, rp);
-    *rp = '\0';
-
-    return result;
+    return OidFunctionCall3(
+                traits.typeinput, 
+                CStringGetDatum((char*) sqlite3_column_text(stmt, col)),
+                ObjectIdGetDatum(InvalidOid), 
+                Int32GetDatum(traits.typmod));
 }
 
 
-char **
-build_rowStringRepresentation(sqlite3_stmt * stmt)
+static Datum
+make_datumInt__(sqlite3_stmt *stmt, int col, Oid pgtyp, 
+                PgTypeInputTraits__ traits)
 {
-    char ** values = (char **) palloc(
-                        sizeof(char *) * 
-                        sqlite3_column_count(stmt));
-    int x;
-    
-    for (x = 0; x < sqlite3_column_count(stmt); x++)
-        switch ( sqlite3_column_type(stmt, x ) )
-        {
-            case SQLITE_INTEGER:
-            case SQLITE_FLOAT:
-            case SQLITE_TEXT:
-                values[x] = (char *) 
-                        sqlite3_column_text(stmt, x);
-                break;
-            case SQLITE_BLOB:
-                values[x] = convert_blobToHex__(
-                    sqlite3_column_blob(stmt, x),
-                    sqlite3_column_bytes(stmt, x));
-                break;
-            default:
-                values[x] = NULL;
-                break;
-        }
-    return values;
+    switch ( pgtyp )
+    {
+        case BOOLOID:
+            return BoolGetDatum(sqlite3_column_int(stmt, col) > 0);
+        
+        case INT8OID:
+            return Int64GetDatum(sqlite3_column_int(stmt, col));
+
+        case INT4OID:
+            return Int32GetDatum(sqlite3_column_int(stmt, col));
+
+        case INT2OID:
+            return Int16GetDatum(sqlite3_column_int(stmt, col));
+
+        case CHAROID:
+            return CharGetDatum((char) sqlite3_column_int(stmt, col));
+
+        default:
+            return make_datumViaCString__(stmt, col, traits);
+    }
+}
+
+
+static Datum
+make_datumFloat__(sqlite3_stmt *stmt, int col, Oid pgtyp, 
+                  PgTypeInputTraits__ traits)
+{
+    switch ( pgtyp )
+    {
+        case FLOAT4OID:
+            return Float4GetDatum((float) sqlite3_column_double(stmt, col));
+        
+        case FLOAT8OID:
+            return Float8GetDatum(sqlite3_column_double(stmt, col));
+        
+        default:
+            return make_datumViaCString__(stmt, col, traits);
+    }
+}
+
+
+static PgTypeInputTraits__
+get_pgTypeInputTraits__(Oid pgtyp)
+{
+    PgTypeInputTraits__ traits;
+	HeapTuple tuple;
+	
+    tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(pgtyp));
+	if (!HeapTupleIsValid(tuple))
+    {
+		elog(ERROR, "cache lookup failed for type%u", pgtyp);
+        traits.valid = false;
+    }
+    else
+    {
+        traits.typeinput = ((Form_pg_type)GETSTRUCT(tuple))->typinput;
+	    traits.typmod  = ((Form_pg_type)GETSTRUCT(tuple))->typtypmod;
+        traits.valid = true;
+    }
+	
+	ReleaseSysCache(tuple);
+    return traits;
 }
 
 
 Datum
 make_datum(sqlite3_stmt *stmt, int col, Oid pgtyp, bool *isnull)
 {
-	Datum valueDatum = 0;
-	regproc typeinput;
-	HeapTuple tuple;
-	int typemod;
-    void * blob = NULL;
+    PgTypeInputTraits__ traits = get_pgTypeInputTraits__(pgtyp);
+    if (!traits.valid)
+        return (Datum) 0;
 	
-    /* get the type's output function */
-	tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(pgtyp));
-	if (!HeapTupleIsValid(tuple))
-		elog(ERROR, "cache lookup failed for type%u", pgtyp);
-
-	typeinput = ((Form_pg_type)GETSTRUCT(tuple))->typinput;
-	typemod  = ((Form_pg_type)GETSTRUCT(tuple))->typtypmod;
-	ReleaseSysCache(tuple);
-    
-    switch ( sqlite3_column_type(stmt, col ) )
+    *isnull = false;
+    switch ( sqlite3_column_type(stmt, col) )
     {
         case SQLITE_INTEGER:
+            return make_datumInt__(stmt, col, pgtyp, traits);
         case SQLITE_FLOAT:
+            return make_datumFloat__(stmt, col, pgtyp, traits);
         case SQLITE_TEXT:
-            *isnull = false;
-			valueDatum = CStringGetDatum((char*)
-                    sqlite3_column_text(stmt, col));
-            break;
+            return make_datumViaCString__(stmt, col, traits);
         case SQLITE_BLOB:
-            *isnull = false;
-            blob = palloc(sqlite3_column_bytes(stmt, col) + 
-                          VARHDRSZ);
+        {
+            void * blob = palloc(sqlite3_column_bytes(stmt, col) + VARHDRSZ);
             memcpy((char *)blob + VARHDRSZ, 
                     sqlite3_column_blob(stmt, col), 
                     sqlite3_column_bytes(stmt, col));
-			SET_VARSIZE(blob, 
-                        sqlite3_column_bytes(stmt, col) + VARHDRSZ);
+			SET_VARSIZE(blob, sqlite3_column_bytes(stmt, col) + VARHDRSZ);
 			return PointerGetDatum(blob);
+        }
         case SQLITE_NULL:
+        default:
             *isnull = true;
-            return valueDatum;
+            return (Datum) 0;
     }
-
-    return OidFunctionCall3(
-                typeinput, 
-                valueDatum, 
-                ObjectIdGetDatum(InvalidOid), 
-                Int32GetDatum(typemod));
 }

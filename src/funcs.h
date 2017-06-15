@@ -1,7 +1,6 @@
 #ifndef SQLITE_FDW_FUNCS_H
 #define SQLITE_FDW_FUNCS_H
 
-
 typedef struct SqliteTableImportOptions
 {
     bool import_notnull;
@@ -28,6 +27,5 @@ SqliteTableImportOptions get_sqliteTableImportOptions(
         ImportForeignSchemaStmt *stmt);
 SqliteTableSource get_tableSource(Oid foreigntableid);
 Datum make_datum(sqlite3_stmt *stmt, int col, Oid pgtyp, bool *isnull);
-
 
 #endif

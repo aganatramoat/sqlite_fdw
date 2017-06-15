@@ -160,8 +160,8 @@ prepare_sqliteQuery(sqlite3 *db, char *query, const char **pzTail)
 {
     sqlite3_stmt *stmt;
     
-    elog(SQLITE_FDW_LOG_LEVEL, 
-         "entering function prepare_sqliteQuery with \n%s", query);
+    // elog(SQLITE_FDW_LOG_LEVEL, 
+         // "entering function prepare_sqliteQuery with \n%s", query);
 
 	/* Execute the query */
 	if ( sqlite3_prepare_v2(db, query, -1, &stmt, pzTail) != 

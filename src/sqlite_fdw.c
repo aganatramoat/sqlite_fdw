@@ -17,12 +17,17 @@
 #include <postgres.h>
 
 #include <access/reloptions.h>
+#include <access/htup_details.h>
 #include <foreign/fdwapi.h>
 #include <foreign/foreign.h>
 #include <optimizer/pathnode.h>
 #include <optimizer/planmain.h>
 #include <optimizer/restrictinfo.h>
 #include <optimizer/var.h>
+#include <optimizer/cost.h>
+#include <optimizer/clauses.h>
+#include <optimizer/tlist.h>
+#include <optimizer/paths.h>
 
 #include <funcapi.h>
 #include <catalog/pg_collation.h>
@@ -34,6 +39,7 @@
 #include <utils/builtins.h>
 #include <utils/formatting.h>
 #include <utils/rel.h>
+#include <utils/selfuncs.h>
 #include <utils/lsyscache.h>
 #include <utils/memutils.h>
 #include <nodes/nodeFuncs.h>
@@ -41,9 +47,14 @@
 #include <sqlite3.h>
 #include <sys/stat.h>
 
+#include <signal.h>
+#include <sys/types.h>
+#include <unistd.h>
+
 #include "sqlite_fdw.h"
 #include "funcs.h"
 #include "deparse.h"
+#include "sqlite_private.h"
 
 PG_MODULE_MAGIC;
 
@@ -55,7 +66,8 @@ PG_MODULE_MAGIC;
    (without stats, sqlite defaults to 1 million tuples for a table)
  */
 #define DEFAULT_ESTIMATED_LINES 1000000
-#define DEFAULT_STARTUP_COST 10
+#define DEFAULT_FDW_STARTUP_COST 100.0
+#define DEFAULT_FDW_SORT_MULTIPLIER 1.2
 
 /*
  * SQL functions
@@ -68,87 +80,89 @@ PG_FUNCTION_INFO_V1(sqlite_fdw_validator);
 
 
 /* callback functions */
-static void sqliteGetForeignRelSize(PlannerInfo *root,
-						   RelOptInfo *baserel,
-						   Oid foreigntableid);
-
-static void sqliteGetForeignPaths(PlannerInfo *root,
-						 RelOptInfo *baserel,
-						 Oid foreigntableid);
-
-static ForeignScan *sqliteGetForeignPlan(PlannerInfo *root,
-						RelOptInfo *baserel,
-						Oid foreigntableid,
-						ForeignPath *best_path,
-						List *tlist,
-						List *scan_clauses,
-						Plan *outer_plan);
-
-static void sqliteBeginForeignScan(ForeignScanState *node,
-						  int eflags);
-
+static void sqliteGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
+						            Oid foreigntableid);
+static void sqliteGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
+						          Oid foreigntableid);
+static ForeignScan *sqliteGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
+						                 Oid foreigntableid,
+						                 ForeignPath *best_path, List *tlist,
+						                 List *scan_clauses, Plan *outer_plan);
+static void sqliteBeginForeignScan(ForeignScanState *node, int eflags);
 static TupleTableSlot *sqliteIterateForeignScan(ForeignScanState *node);
-
 static void sqliteReScanForeignScan(ForeignScanState *node);
-
 static void sqliteEndForeignScan(ForeignScanState *node);
-
 static void sqliteAddForeignUpdateTargets(Query *parsetree,
-								 RangeTblEntry *target_rte,
-								 Relation target_relation);
-
-static List *sqlitePlanForeignModify(PlannerInfo *root,
-						   ModifyTable *plan,
-						   Index resultRelation,
-						   int subplan_index);
-
+								          RangeTblEntry *target_rte,
+								          Relation target_relation);
+static List *sqlitePlanForeignModify(PlannerInfo *root, ModifyTable *plan,
+						             Index resultRelation,
+						             int subplan_index);
 static void sqliteBeginForeignModify(ModifyTableState *mtstate,
-							ResultRelInfo *rinfo,
-							List *fdw_private,
-							int subplan_index,
-							int eflags);
-
+							         ResultRelInfo *rinfo,
+							         List *fdw_private, int subplan_index,
+							         int eflags);
 static TupleTableSlot *sqliteExecForeignInsert(EState *estate,
-						   ResultRelInfo *rinfo,
-						   TupleTableSlot *slot,
-						   TupleTableSlot *planSlot);
-
+						                       ResultRelInfo *rinfo,
+						                       TupleTableSlot *slot,
+						                       TupleTableSlot *planSlot);
 static TupleTableSlot *sqliteExecForeignUpdate(EState *estate,
-						   ResultRelInfo *rinfo,
-						   TupleTableSlot *slot,
-						   TupleTableSlot *planSlot);
-
+						                       ResultRelInfo *rinfo,
+						                       TupleTableSlot *slot,
+						                       TupleTableSlot *planSlot);
 static TupleTableSlot *sqliteExecForeignDelete(EState *estate,
 						   ResultRelInfo *rinfo,
 						   TupleTableSlot *slot,
 						   TupleTableSlot *planSlot);
-
-static void sqliteEndForeignModify(EState *estate,
-						  ResultRelInfo *rinfo);
-
-static void sqliteExplainForeignScan(ForeignScanState *node,
-							struct ExplainState *es);
-
+static void sqliteEndForeignModify(EState *estate, ResultRelInfo *rinfo);
+static void sqliteExplainForeignScan(ForeignScanState *node, 
+                                     struct ExplainState *es);
 static void sqliteExplainForeignModify(ModifyTableState *mtstate,
 							  ResultRelInfo *rinfo,
 							  List *fdw_private,
 							  int subplan_index,
 							  struct ExplainState *es);
-
 static bool sqliteAnalyzeForeignTable(Relation relation,
 							 AcquireSampleRowsFunc *func,
 							 BlockNumber *totalpages);
-
 static List *sqliteImportForeignSchema(ImportForeignSchemaStmt *stmt,
-							 Oid serverOid);
+							           Oid serverOid);
+static void sqliteGetForeignJoinPaths(PlannerInfo *root,
+                          RelOptInfo *joinrel,
+                          RelOptInfo *outerrel,
+                          RelOptInfo *innerrel,
+                          JoinType jointype,
+                          JoinPathExtraData *extra);
 
 /*
  * Helper functions
  */
 static bool sqliteIsValidOption(const char *option, Oid context);
-static int GetEstimatedRows(sqlite3 *db, char * sql);
 static bool file_exists(const char *name);
-
+static void estimate_path_cost_size(PlannerInfo *root,
+						RelOptInfo *baserel,
+						List *join_conds,
+						List *pathkeys,
+                        SqliteRelationCosts *costs);
+static void add_paths_with_pathkeys_for_rel(PlannerInfo *root, 
+                                            RelOptInfo *rel,
+								            Path *epq_path);
+static const char * get_jointype_name(JoinType jointype);
+static void estimate_join_rel_cost(PlannerInfo *root,
+					               RelOptInfo *foreignrel,
+                                   SqliteCostEstimates * est);
+static void estimate_upper_rel_cost(PlannerInfo *root,
+					                RelOptInfo *foreignrel,
+                                    SqliteCostEstimates * est);
+static void estimate_base_rel_cost(PlannerInfo *root,
+					                RelOptInfo *foreignrel,
+                                    SqliteCostEstimates * est);
+static List * get_useful_pathkeys_for_relation(PlannerInfo *root, 
+                                               RelOptInfo *rel);
+static Expr * find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel);
+static bool ec_member_matches_foreign(PlannerInfo *root, RelOptInfo *rel,
+						  EquivalenceClass *ec, EquivalenceMember *em,
+						  void *arg);
 
 /*
  * structures used by the FDW
@@ -180,24 +194,6 @@ static struct SQLiteFdwOption valid_options[] =
 };
 
 
-typedef struct SqliteFdwRelationInfo
-{
-    // Filename (i.e. sqlite database and tablename)
-    SqliteTableSource src;
-
-    sqlite3 *db;
-	
-    /* baserestrictinfo clauses, broken down into safe/unsafe */
-	List	   *remote_conds;
-	List	   *local_conds;
-
-	/* Bitmap of attr numbers to fetch from the remote server. */
-	Bitmapset  *attrs_used;
-
-} SqliteFdwRelationInfo;
-
-
-
 /*
  * FDW-specific information for ForeignScanState.fdw_state.
  */
@@ -220,6 +216,9 @@ static void sqlite_bind_param_value(SqliteFdwExecutionState *festate,
                                     Datum pval, 
                                     bool isNull);
 static void cleanup_(SqliteFdwExecutionState *);
+static bool foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel,
+				JoinType jointype, RelOptInfo *outerrel, RelOptInfo *innerrel,
+				JoinPathExtraData *extra);
 
 
 Datum
@@ -227,7 +226,7 @@ sqlite_fdw_handler(PG_FUNCTION_ARGS)
 {
 	FdwRoutine *fdwroutine = makeNode(FdwRoutine);
 
-	elog(SQLITE_FDW_LOG_LEVEL,"entering function %s", __func__);
+	// elog(SQLITE_FDW_LOG_LEVEL,"entering function %s", __func__);
 
 	/* assign the handlers for the FDW */
 
@@ -259,6 +258,9 @@ sqlite_fdw_handler(PG_FUNCTION_ARGS)
 
 	/* support for IMPORT FOREIGN SCHEMA */
 	fdwroutine->ImportForeignSchema = sqliteImportForeignSchema;
+	
+    /* Support functions for join push-down */
+	fdwroutine->GetForeignJoinPaths = sqliteGetForeignJoinPaths;
 
 	PG_RETURN_POINTER(fdwroutine);
 }
@@ -272,7 +274,7 @@ sqlite_fdw_validator(PG_FUNCTION_ARGS)
 	char      *svr_table = NULL;
 	ListCell  *cell;
 
-	elog(SQLITE_FDW_LOG_LEVEL, "entering function %s", __func__);
+	// elog(SQLITE_FDW_LOG_LEVEL, "entering function %s", __func__);
 
 	/*
 	 * Check that only options supported by sqlite_fdw,
@@ -371,17 +373,15 @@ sqliteGetForeignRelSize(PlannerInfo *root,
 {
 	SqliteFdwRelationInfo *fpinfo;
 	ListCell              *lc;
-	List                  *retrieved_attrs = NULL;
-	StringInfoData        sql;
-	List                  *params_list = NULL;
     
-    elog(SQLITE_FDW_LOG_LEVEL, 
-         "entering function sqliteGetForeignRelSize");
+    //elog(SQLITE_FDW_LOG_LEVEL, 
+         // "entering function sqliteGetForeignRelSize");
 
     // initialize the fields of baserel that we will set
 	baserel->rows = 0;
 	fpinfo = palloc0(sizeof(SqliteFdwRelationInfo));
     fpinfo->src = get_tableSource(foreigntableid);
+    fpinfo->pushdown_safe = true;
 	baserel->fdw_private = (void *) fpinfo;
     
     pull_varattnos((Node *) baserel->reltarget->exprs, 
@@ -407,50 +407,79 @@ sqliteGetForeignRelSize(PlannerInfo *root,
                         baserel->relid, 
                         &fpinfo->attrs_used);
 	}
+
+    // Get the costing done
+	/*
+	 * Compute the selectivity and cost of the local_conds, so we don't have
+	 * to do it over again for each path.  The best we can do for these
+	 * conditions is to estimate selectivity on the basis of local statistics.
+	 */
+	fpinfo->costs.local_conds_sel = clauselist_selectivity(root,
+													 fpinfo->local_conds,
+													 baserel->relid,
+													 JOIN_INNER,
+													 NULL);
+
+	cost_qual_eval(&fpinfo->costs.local_conds_cost, fpinfo->local_conds, root);
+	
+    /*
+	 * Set cached relation costs to some negative value, so that we can detect
+	 * when they are set to some sensible costs during one (usually the first)
+	 * of the calls to estimate_path_cost_size().
+	 */
+	fpinfo->costs.rel_startup_cost = -1;
+	fpinfo->costs.rel_total_cost = -1;
+
+    /*
+     *   We are going to assume that postgres is responsible for keeping 
+     *   the statistics for the foreign tables.  This saves us the major
+     *   headache of extracting/translating sqlite3 information
+     */
     
-    // Form the query that will be sent to sqlite
-    initStringInfo(&sql);
-    deparse_selectStmt(&sql, root, baserel, fpinfo->attrs_used, 
-                          fpinfo->src.table, &retrieved_attrs);
-    if (fpinfo->remote_conds)
-        append_whereClause(&sql, root, baserel, fpinfo->remote_conds,
-						           true, &params_list);
-
-	/* Connect to the server */
-	fpinfo->db = get_sqliteDbHandle(fpinfo->src.database);
-	baserel->rows = GetEstimatedRows(fpinfo->db, sql.data);
-    baserel->tuples = baserel->rows;
-}
-
-
-/*   Going to use sqlite_stmt_scanstatus to get an an estimate
- *   of the number of rows.
- *   The function sqlite_stmt_scanstatus is not a part of the standard
- *   sqlite3 distribution.
- */
-static int
-GetEstimatedRows(sqlite3 *db, char * sql)
-{
-	sqlite3_stmt   *stmt;
-	const char	   *pzTail;
-    double          estimate = 0;
-    
-    elog(SQLITE_FDW_LOG_LEVEL, "entering function GetEstimatedRows");
-
-	stmt = prepare_sqliteQuery(db, sql, &pzTail);
-    sqlite3_stmt_scanstatus_reset(stmt);
-    if ( sqlite3_stmt_scanstatus(stmt, 0, SQLITE_SCANSTAT_EST, &estimate ) != 
-            SQLITE_OK ) 
+    /*
+     * If the foreign table has never been ANALYZEd, it will have relpages
+     * and reltuples equal to zero, which most likely has nothing to do
+     * with reality.  We can't do a whole lot about that if we're not
+     * allowed to consult the remote server, but we can use a hack similar
+     * to plancat.c's treatment of empty relations: use a minimum size
+     * estimate of 10 pages, and divide by the column-datatype-based width
+     * estimate to get the corresponding number of tuples.
+     */
+    if (baserel->pages == 0 && baserel->tuples == 0)
     {
-	    sqlite3_finalize(stmt);
-		ereport(ERROR,
-			(errcode(ERRCODE_FDW_TABLE_NOT_FOUND),
-			errmsg("Could not run sqlite_stmt_scanstatus")
-			));
+        baserel->pages = 10;
+        baserel->tuples =
+            (10 * BLCKSZ) / (baserel->reltarget->width +
+                             MAXALIGN(SizeofHeapTupleHeader));
     }
 
-	sqlite3_finalize(stmt);
-	return (int) estimate;
+    /* Estimate baserel size as best we can with local statistics. */
+    set_baserel_size_estimates(root, baserel);
+
+    /* Fill in basically-bogus cost estimates for use later. */
+    estimate_path_cost_size(root, baserel, NIL, NIL, &fpinfo->costs);
+	
+    /*
+	 * Set the name of relation in fpinfo, while we are constructing it here.
+	 * It will be used to build the string describing the join relation in
+	 * EXPLAIN output. We can't know whether VERBOSE option is specified or
+	 * not, so always schema-qualify the foreign table name.
+	 */
+	fpinfo->relation_name = makeStringInfo();
+	appendStringInfo(fpinfo->relation_name, "%s.%s",
+         quote_identifier(get_namespace_name(get_rel_namespace(foreigntableid))),
+         quote_identifier(get_rel_name(foreigntableid)));
+
+	/* No outer and inner relations. */
+	fpinfo->subqspec.make_outerrel = false;
+	fpinfo->subqspec.make_innerrel = false;
+	fpinfo->subqspec.lower_rels = NULL;
+	
+    /* Set the relation index. */
+	fpinfo->relation_index = baserel->relid;
+    
+	/* Cache connection to the server */
+	fpinfo->db = get_sqliteDbHandle(fpinfo->src.database);
 }
 
 
@@ -459,37 +488,197 @@ sqliteGetForeignPaths(PlannerInfo *root,
                       RelOptInfo *baserel,
                       Oid foreigntableid)
 {
-	Cost		startup_cost,
-				total_cost;
-
-	startup_cost = DEFAULT_STARTUP_COST;
-	total_cost = startup_cost + baserel->rows;
+	SqliteFdwRelationInfo *fpinfo = (SqliteFdwRelationInfo *) 
+                                     baserel->fdw_private;
+	ForeignPath *path;
+	List	   *ppi_list;
+	ListCell   *lc;
 
 	/* Create a ForeignPath node and add it as only possible path */
 	add_path(baserel, (Path *)
 			 create_foreignscan_path(root, baserel,
 									 NULL,		/* default pathtarget */
-									 baserel->rows,
-									 startup_cost,
-									 total_cost,
+									 fpinfo->costs.rows,
+									 fpinfo->costs.startup_cost,
+									 fpinfo->costs.total_cost,
 									 NIL,		/* no pathkeys */
 									 NULL,		/* no outer rel either */
 									 NULL,		/* no extra plan */
 									 NIL));		/* no fdw_private data */
+	
+    /* Add paths with pathkeys */
+	add_paths_with_pathkeys_for_rel(root, baserel, NULL);
+	
+    /*
+	 * Thumb through all join clauses for the rel to identify which outer
+	 * relations could supply one or more safe-to-send-to-remote join clauses.
+	 * We'll build a parameterized path for each such outer relation.
+	 *
+	 * It's convenient to manage this by representing each candidate outer
+	 * relation by the ParamPathInfo node for it.  We can then use the
+	 * ppi_clauses list in the ParamPathInfo node directly as a list of the
+	 * interesting join clauses for that rel.  This takes care of the
+	 * possibility that there are multiple safe join clauses for such a rel,
+	 * and also ensures that we account for unsafe join clauses that we'll
+	 * still have to enforce locally (since the parameterized-path machinery
+	 * insists that we handle all movable clauses).
+	 */
+	ppi_list = NIL;
+	foreach(lc, baserel->joininfo)
+	{
+		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+		Relids		required_outer;
+		ParamPathInfo *param_info;
+
+		/* Check if clause can be moved to this rel */
+		if (!join_clause_is_movable_to(rinfo, baserel))
+			continue;
+
+		/* See if it is safe to send to remote */
+		if (!is_foreignExpr(root, baserel, rinfo->clause))
+			continue;
+
+		/* Calculate required outer rels for the resulting path */
+		required_outer = bms_union(rinfo->clause_relids,
+								   baserel->lateral_relids);
+		/* We do not want the foreign rel itself listed in required_outer */
+		required_outer = bms_del_member(required_outer, baserel->relid);
+
+		/*
+		 * required_outer probably can't be empty here, but if it were, we
+		 * couldn't make a parameterized path.
+		 */
+		if (bms_is_empty(required_outer))
+			continue;
+
+		/* Get the ParamPathInfo */
+		param_info = get_baserel_parampathinfo(root, baserel,
+											   required_outer);
+		Assert(param_info != NULL);
+
+		/*
+		 * Add it to list unless we already have it.  Testing pointer equality
+		 * is OK since get_baserel_parampathinfo won't make duplicates.
+		 */
+		ppi_list = list_append_unique_ptr(ppi_list, param_info);
+	}
+
+	/*
+	 * The above scan examined only "generic" join clauses, not those that
+	 * were absorbed into EquivalenceClauses.  See if we can make anything out
+	 * of EquivalenceClauses.
+	 */
+	if (baserel->has_eclass_joins)
+	{
+		/*
+		 * We repeatedly scan the eclass list looking for column references
+		 * (or expressions) belonging to the foreign rel.  Each time we find
+		 * one, we generate a list of equivalence joinclauses for it, and then
+		 * see if any are safe to send to the remote.  Repeat till there are
+		 * no more candidate EC members.
+		 */
+		ec_member_foreign_arg arg;
+
+		arg.already_used = NIL;
+		for (;;)
+		{
+			List	   *clauses;
+
+			/* Make clauses, skipping any that join to lateral_referencers */
+			arg.current = NULL;
+			clauses = generate_implied_equalities_for_column(root,
+															 baserel,
+												   ec_member_matches_foreign,
+															 (void *) &arg,
+											   baserel->lateral_referencers);
+
+			/* Done if there are no more expressions in the foreign rel */
+			if (arg.current == NULL)
+			{
+				Assert(clauses == NIL);
+				break;
+			}
+
+			/* Scan the extracted join clauses */
+			foreach(lc, clauses)
+			{
+				RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+				Relids		required_outer;
+				ParamPathInfo *param_info;
+
+				/* Check if clause can be moved to this rel */
+				if (!join_clause_is_movable_to(rinfo, baserel))
+					continue;
+
+				/* See if it is safe to send to remote */
+				if (!is_foreignExpr(root, baserel, rinfo->clause))
+					continue;
+
+				/* Calculate required outer rels for the resulting path */
+				required_outer = bms_union(rinfo->clause_relids,
+										   baserel->lateral_relids);
+				required_outer = bms_del_member(required_outer, baserel->relid);
+				if (bms_is_empty(required_outer))
+					continue;
+
+				/* Get the ParamPathInfo */
+				param_info = get_baserel_parampathinfo(root, baserel,
+													   required_outer);
+				Assert(param_info != NULL);
+
+				/* Add it to list unless we already have it */
+				ppi_list = list_append_unique_ptr(ppi_list, param_info);
+			}
+
+			/* Try again, now ignoring the expression we found this time */
+			arg.already_used = lappend(arg.already_used, arg.current);
+		}
+	}
+
+	/*
+	 * Now build a path for each useful outer relation.
+	 */
+	foreach(lc, ppi_list)
+	{
+		ParamPathInfo *param_info = (ParamPathInfo *) lfirst(lc);
+        SqliteRelationCosts est;
+
+		/* Get a cost estimate from the remote */
+		estimate_path_cost_size(root, baserel,
+								param_info->ppi_clauses, NIL, &est);
+
+		/*
+		 * ppi_rows currently won't get looked at by anything, but still we
+		 * may as well ensure that it matches our idea of the rowcount.
+		 */
+		param_info->ppi_rows = est.rows;
+
+		/* Make the path */
+		path = create_foreignscan_path(root, baserel,
+									   NULL,	/* default pathtarget */
+									   est.rows,
+									   est.startup_cost,
+									   est.total_cost,
+									   NIL,		/* no pathkeys */
+									   param_info->ppi_req_outer,
+									   NULL,
+									   NIL);	/* no fdw_private list */
+		add_path(baserel, (Path *) path);
+	}
 }
 
+    
 static ForeignScan *
-sqliteGetForeignPlan(PlannerInfo *root,
-					 RelOptInfo *baserel,
-					 Oid foreigntableid,
-					 ForeignPath *best_path,
-					 List *tlist,
-					 List *scan_clauses,
-					 Plan *outer_plan)
+get_foreignPlanSimple__(PlannerInfo *root,
+					    RelOptInfo *baserel,
+					    Oid foreigntableid,
+					    ForeignPath *best_path,
+					    List *tlist,
+					    List *scan_clauses,
+					    Plan *outer_plan)
 {
 	SqliteFdwRelationInfo *fpinfo = (SqliteFdwRelationInfo *) 
                                      baserel->fdw_private;
-	Index		scan_relid = baserel->relid;
 	List        *fdw_private;
 	List        *local_exprs = NULL;
 	List        *remote_exprs = NULL;
@@ -568,13 +757,167 @@ sqliteGetForeignPlan(PlannerInfo *root,
 	 */
 	return make_foreignscan(tlist,
 	                        local_exprs,
-	                        scan_relid,
+	                        baserel->relid,
 	                        params_list,
 	                        fdw_private,
 	                        NIL,
-	                        NIL,
+	                        remote_exprs,
 	                        outer_plan
 	                       );
+}
+
+
+/*
+ * Build the targetlist for given relation to be deparsed as SELECT clause.
+ *
+ * The output targetlist contains the columns that need to be fetched from the
+ * foreign server for the given relation.  If foreignrel is an upper relation,
+ * then the output targetlist can also contain expressions to be evaluated on
+ * foreign server.
+ */
+static List *
+build_tlist_to_deparse(RelOptInfo *foreignrel)
+{
+	List	   *tlist = NIL;
+	SqliteFdwRelationInfo *fpinfo = (SqliteFdwRelationInfo *) 
+                                     foreignrel->fdw_private;
+	ListCell   *lc;
+
+	/*
+	 * For an upper relation, we have already built the target list while
+	 * checking shippability, so just return that.
+	 */
+	if (IS_UPPER_REL(foreignrel))
+		return fpinfo->grouped_tlist;
+
+	/*
+	 * We require columns specified in foreignrel->reltarget->exprs and those
+	 * required for evaluating the local conditions.
+	 */
+	tlist = add_to_flat_tlist(tlist,
+					   pull_var_clause((Node *) foreignrel->reltarget->exprs,
+									   PVC_RECURSE_PLACEHOLDERS));
+	foreach(lc, fpinfo->local_conds)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+
+		tlist = add_to_flat_tlist(tlist,
+								  pull_var_clause((Node *) rinfo->clause,
+												  PVC_RECURSE_PLACEHOLDERS));
+	}
+
+	return tlist;
+}
+
+    
+static ForeignScan *
+get_foreignPlanJoinUpper__(PlannerInfo *root,
+					       RelOptInfo *foreignrel,
+					       Oid foreigntableid,
+					       ForeignPath *best_path,
+					       List *tlist,
+					       List *scan_clauses,
+					       Plan *outer_plan)
+{
+	SqliteFdwRelationInfo *fpinfo = (SqliteFdwRelationInfo *) 
+                                     foreignrel->fdw_private;
+	List        *local_exprs = NULL;
+	List        *remote_exprs = NULL;
+	List	   *fdw_scan_tlist = NULL;
+    /*
+     * For a join rel, baserestrictinfo is NIL and we are not considering
+     * parameterization right now, so there should be no scan_clauses for
+     * a joinrel or an upper rel either.
+     */
+    Assert(!scan_clauses);
+
+    /*
+     * Instead we get the conditions to apply from the fdw_private
+     * structure.
+     */
+    remote_exprs = extract_actual_clauses(fpinfo->remote_conds, false);
+    local_exprs = extract_actual_clauses(fpinfo->local_conds, false);
+
+    /*
+     * We leave fdw_recheck_quals empty in this case, since we never need
+     * to apply EPQ recheck clauses.  In the case of a joinrel, EPQ
+     * recheck is handled elsewhere --- see postgresGetForeignJoinPaths().
+     * If we're planning an upperrel (ie, remote grouping or aggregation)
+     * then there's no EPQ to do because SELECT FOR UPDATE wouldn't be
+     * allowed, and indeed we *can't* put the remote clauses into
+     * fdw_recheck_quals because the unaggregated Vars won't be available
+     * locally.
+     */
+
+    /* Build the list of columns to be fetched from the foreign server. */
+    fdw_scan_tlist = build_tlist_to_deparse(foreignrel);
+
+    /*
+     * Ensure that the outer plan produces a tuple whose descriptor
+     * matches our scan tuple slot. This is safe because all scans and
+     * joins support projection, so we never need to insert a Result node.
+     * Also, remove the local conditions from outer plan's quals, lest
+     * they will be evaluated twice, once by the local plan and once by
+     * the scan.
+     */
+    if (outer_plan)
+    {
+        ListCell   *lc;
+
+        /*
+         * Right now, we only consider grouping and aggregation beyond
+         * joins. Queries involving aggregates or grouping do not require
+         * EPQ mechanism, hence should not have an outer plan here.
+         */
+        Assert(!IS_UPPER_REL(foreignrel));
+
+        outer_plan->targetlist = fdw_scan_tlist;
+
+        foreach(lc, local_exprs)
+        {
+            Join	   *join_plan = (Join *) outer_plan;
+            Node	   *qual = lfirst(lc);
+
+            outer_plan->qual = list_delete(outer_plan->qual, qual);
+
+            /*
+             * For an inner join the local conditions of foreign scan plan
+             * can be part of the joinquals as well.
+             */
+            if (join_plan->jointype == JOIN_INNER)
+                join_plan->joinqual = list_delete(join_plan->joinqual,
+                                                  qual);
+        }
+    }
+	return make_foreignscan(tlist,
+	                        local_exprs,
+	                        0,
+	                        params_list,
+	                        fdw_private,
+	                        fdw_scan_tlist,
+	                        NULL,
+	                        outer_plan
+	                       );
+}
+
+
+static ForeignScan *
+sqliteGetForeignPlan(PlannerInfo *root,
+					 RelOptInfo *baserel,
+					 Oid foreigntableoid,
+					 ForeignPath *best_path,
+					 List *tlist,
+					 List *scan_clauses,
+					 Plan *outer_plan)
+{
+	if (IS_SIMPLE_REL(baserel))
+        return get_foreignPlanSimple__(root, baserel, foreigntableoid,
+                                       best_path, tlist, scan_clauses,
+                                       outer_plan);
+    else
+        return get_foreignPlanJoinUpper__(root, baserel, foreigntableoid,
+                                          best_path, tlist, scan_clauses,
+                                          outer_plan);
 }
 
 
@@ -605,7 +948,7 @@ sqliteBeginForeignScan(ForeignScanState *node,
     SqliteFdwRelationInfo *fpinfo = (SqliteFdwRelationInfo *)
                                     list_nth(fsplan->fdw_private, 2);
 
-	elog(SQLITE_FDW_LOG_LEVEL, "entering function %s", __func__);
+	// elog(SQLITE_FDW_LOG_LEVEL, "entering function %s", __func__);
 	
     /*
 	 * We'll save private state in node->fdw_state.
@@ -698,7 +1041,7 @@ sqliteReScanForeignScan(ForeignScanState *node)
 	 * return exactly the same rows.
 	 */
 
-	elog(SQLITE_FDW_LOG_LEVEL, "entering function %s", __func__);
+	// elog(SQLITE_FDW_LOG_LEVEL, "entering function %s", __func__);
 }
 
 
@@ -963,10 +1306,11 @@ sqliteExplainForeignScan(ForeignScanState *node,
 	char					   *query;
 	size_t						len;
 	const char				   *pzTail;
-	SqliteFdwExecutionState	   *festate = (SqliteFdwExecutionState *) node->fdw_state;
+	SqliteFdwExecutionState	   *festate = (SqliteFdwExecutionState *) 
+                                          node->fdw_state;
     SqliteTableSource          opt;
 
-	elog(SQLITE_FDW_LOG_LEVEL, "entering function %s", __func__);
+	// elog(SQLITE_FDW_LOG_LEVEL, "entering function %s", __func__);
 
 	/* Show the query (only if VERBOSE) */
 	if (es->verbose)
@@ -1291,4 +1635,851 @@ cleanup_(SqliteFdwExecutionState *festate)
         sqlite3_close(festate->db);
         festate->stmt = NULL;
     }
+}
+
+
+/*
+ * postgresGetForeignJoinPaths
+ *		Add possible ForeignPath to joinrel, if join is safe to push down.
+ */
+static void
+sqliteGetForeignJoinPaths(PlannerInfo *root,
+                          RelOptInfo *joinrel,
+                          RelOptInfo *outerrel,
+                          RelOptInfo *innerrel,
+                          JoinType jointype,
+                          JoinPathExtraData *extra)
+{
+	SqliteFdwRelationInfo *fpinfo;
+	ForeignPath *joinpath;
+	Path	   *epq_path;		/* Path to create plan to be executed when
+								 * EvalPlanQual gets triggered. */
+	
+    elog(SQLITE_FDW_LOG_LEVEL,"XXXXXXXX startGetForeignJoin");
+
+	/*
+	 * Skip if this join combination has been considered already.
+	 */
+	if (joinrel->fdw_private)
+		return;
+
+	/*
+	 * Create unfinished SqliteFdwRelationInfo entry which is used to indicate
+	 * that the join relation is already considered, so that we won't waste
+	 * time in judging safety of join pushdown and adding the same paths again
+	 * if found safe. Once we know that this join can be pushed down, we fill
+	 * the entry.
+	 */
+	fpinfo = (SqliteFdwRelationInfo *) palloc0(sizeof(SqliteFdwRelationInfo));
+	fpinfo->pushdown_safe = false;
+	joinrel->fdw_private = fpinfo;
+	/* attrs_used is only for base relations. */
+	fpinfo->attrs_used = NULL;
+
+	/*
+	 * If there is a possibility that EvalPlanQual will be executed, we need
+	 * to be able to reconstruct the row using scans of the base relations.
+	 * GetExistingLocalJoinPath will find a suitable path for this purpose in
+	 * the path list of the joinrel, if one exists.  We must be careful to
+	 * call it before adding any ForeignPath, since the ForeignPath might
+	 * dominate the only suitable local path available.  We also do it before
+	 * reconstruct the row for EvalPlanQual(). Find an alternative local path
+	 * calling foreign_join_ok(), since that function updates fpinfo and marks
+	 * it as pushable if the join is found to be pushable.
+	 */
+	if (root->parse->commandType == CMD_DELETE ||
+		root->parse->commandType == CMD_UPDATE ||
+		root->rowMarks)
+	{
+		epq_path = GetExistingLocalJoinPath(joinrel);
+		if (!epq_path)
+		{
+			elog(DEBUG3, "could not push down foreign join because "
+                         "a local path suitable for EPQ checks was not found");
+			return;
+		}
+	}
+	else
+		epq_path = NULL;
+
+	if (!foreign_join_ok(root, joinrel, jointype, outerrel, innerrel, extra))
+	{
+		/* Free path required for EPQ if we copied one; we don't need it now */
+		if (epq_path)
+			pfree(epq_path);
+		return;
+	}
+    elog(SQLITE_FDW_LOG_LEVEL,"XXXXXXXX GetForeignJoinPaths 1");
+
+	/*
+	 * Compute the selectivity and cost of the local_conds, so we don't have
+	 * to do it over again for each path. The best we can do for these
+	 * conditions is to estimate selectivity on the basis of local statistics.
+	 * The local conditions are applied after the join has been computed on
+	 * the remote side like quals in WHERE clause, so pass jointype as
+	 * JOIN_INNER.
+	 */
+	fpinfo->costs.local_conds_sel = clauselist_selectivity(
+        root,
+        fpinfo->local_conds,
+        0,
+        JOIN_INNER,
+        NULL);
+	cost_qual_eval(&fpinfo->costs.local_conds_cost, fpinfo->local_conds, root);
+    fpinfo->joinspec.clause_sel = clauselist_selectivity(
+                root, fpinfo->joinspec.clauses,
+                0, fpinfo->joinspec.type,
+                extra->sjinfo);
+
+	/* Estimate costs for bare join relation */
+	estimate_path_cost_size(root, joinrel, NIL, NIL, &fpinfo->costs);
+	/* Now update this information in the joinrel */
+	joinrel->rows = fpinfo->costs.rows;
+	joinrel->reltarget->width = fpinfo->costs.width;
+    elog(SQLITE_FDW_LOG_LEVEL,"XXXXXXXX GetForeignJoinPaths 2 %f %f", 
+                fpinfo->costs.startup_cost, 
+                fpinfo->costs.total_cost);
+
+	/*
+	 * Create a new join path and add it to the joinrel which represents a
+	 * join between foreign tables.
+	 */
+    // AG TODO: the total cost is hardocded here
+	joinpath = create_foreignscan_path(root,
+									   joinrel,
+									   NULL,	/* default pathtarget */
+									   joinrel->rows,
+									   fpinfo->costs.startup_cost,
+									   // fpinfo->costs.total_cost,
+                                       1.0,
+									   NIL,		/* no pathkeys */
+									   NULL,	/* no required_outer */
+									   epq_path,
+									   NIL);	/* no fdw_private */
+
+	/* Add generated path into joinrel by add_path(). */
+	add_path(joinrel, (Path *) joinpath);
+
+	/* Consider pathkeys for the join relation */
+	add_paths_with_pathkeys_for_rel(root, joinrel, epq_path);
+    
+    elog(SQLITE_FDW_LOG_LEVEL,"XXXXXXXX GetForeignJoinPaths 3 %d", 
+                getpid());
+    raise(SIGSTOP);
+
+	/* XXX Consider parameterized paths for the join relation */
+}
+
+
+/*
+ * Assess whether the join between inner and outer relations can be pushed down
+ * to the foreign server. As a side effect, save information we obtain in this
+ * function to SqliteFdwRelationInfo passed in.
+ */
+static bool
+foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
+				RelOptInfo *outerrel, RelOptInfo *innerrel,
+				JoinPathExtraData *extra)
+{
+	SqliteFdwRelationInfo *fpinfo;
+	SqliteFdwRelationInfo *fpinfo_o;
+	SqliteFdwRelationInfo *fpinfo_i;
+	ListCell   *lc;
+	List	   *joinclauses;
+
+	/*
+	 * We support pushing down INNER, LEFT, RIGHT and FULL OUTER joins.
+	 * Constructing queries representing SEMI and ANTI joins is hard, hence
+	 * not considered right now.
+	 */
+	if (jointype != JOIN_INNER && jointype != JOIN_LEFT &&
+		jointype != JOIN_RIGHT && jointype != JOIN_FULL)
+		return false;
+
+	/*
+	 * If either of the joining relations is marked as unsafe to pushdown, the
+	 * join can not be pushed down.
+	 */
+	fpinfo = (SqliteFdwRelationInfo *) joinrel->fdw_private;
+	fpinfo_o = (SqliteFdwRelationInfo *) outerrel->fdw_private;
+	fpinfo_i = (SqliteFdwRelationInfo *) innerrel->fdw_private;
+	if (!fpinfo_o || !fpinfo_o->pushdown_safe ||
+		!fpinfo_i || !fpinfo_i->pushdown_safe)
+		return false;
+
+	/*
+	 * If joining relations have local conditions, those conditions are
+	 * required to be applied before joining the relations. Hence the join can
+	 * not be pushed down.
+	 */
+	if (fpinfo_o->local_conds || fpinfo_i->local_conds)
+		return false;
+
+	/*
+	 * Merge FDW options.  We might be tempted to do this after we have deemed
+	 * the foreign join to be OK.  But we must do this beforehand so that we
+	 * know which quals can be evaluated on the foreign server, which might
+	 * depend on shippable_extensions.
+	 */
+	// fpinfo->server = fpinfo_o->server;
+	// merge_fdw_options(fpinfo, fpinfo_o, fpinfo_i);
+
+	/*
+	 * Separate restrict list into join quals and pushed-down (other) quals.
+	 *
+	 * Join quals belonging to an outer join must all be shippable, else we
+	 * cannot execute the join remotely.  Add such quals to 'joinclauses'.
+	 *
+	 * Add other quals to fpinfo->remote_conds if they are shippable, else to
+	 * fpinfo->local_conds.  In an inner join it's okay to execute conditions
+	 * either locally or remotely; the same is true for pushed-down conditions
+	 * at an outer join.
+	 *
+	 * Note we might return failure after having already scribbled on
+	 * fpinfo->remote_conds and fpinfo->local_conds.  That's okay because we
+	 * won't consult those lists again if we deem the join unshippable.
+	 */
+	joinclauses = NIL;
+	foreach(lc, extra->restrictlist)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+		bool		is_remote_clause = is_foreignExpr(root, joinrel,
+													  rinfo->clause);
+
+		if (IS_OUTER_JOIN(jointype) && !rinfo->is_pushed_down)
+		{
+			if (!is_remote_clause)
+				return false;
+			joinclauses = lappend(joinclauses, rinfo);
+		}
+		else
+		{
+			if (is_remote_clause)
+				fpinfo->remote_conds = lappend(fpinfo->remote_conds, rinfo);
+			else
+				fpinfo->local_conds = lappend(fpinfo->local_conds, rinfo);
+		}
+	}
+
+	/*
+	 * deparseExplicitTargetList() isn't smart enough to handle anything other
+	 * than a Var.  In particular, if there's some PlaceHolderVar that would
+	 * need to be evaluated within this join tree (because there's an upper
+	 * reference to a quantity that may go to NULL as a result of an outer
+	 * join), then we can't try to push the join down because we'll fail when
+	 * we get to deparseExplicitTargetList().  However, a PlaceHolderVar that
+	 * needs to be evaluated *at the top* of this join tree is OK, because we
+	 * can do that locally after fetching the results from the remote side.
+	 */
+	foreach(lc, root->placeholder_list)
+	{
+		PlaceHolderInfo *phinfo = lfirst(lc);
+		Relids		relids = joinrel->relids;
+
+		if (bms_is_subset(phinfo->ph_eval_at, relids) &&
+			bms_nonempty_difference(relids, phinfo->ph_eval_at))
+			return false;
+	}
+
+	/* Save the join clauses, for later use. */
+	fpinfo->joinspec.clauses = joinclauses;
+
+	fpinfo->joinspec.outerrel = outerrel;
+	fpinfo->joinspec.innerrel = innerrel;
+	fpinfo->joinspec.type = jointype;
+
+	/*
+	 * By default, both the input relations are not required to be deparsed
+	 * as subqueries, but there might be some relations covered by the input
+	 * relations that are required to be deparsed as subqueries, so save the
+	 * relids of those relations for later use by the deparser.
+	 */
+	fpinfo->subqspec.make_outerrel = false;
+	fpinfo->subqspec.make_innerrel = false;
+	Assert(bms_is_subset(fpinfo_o->subqspec.lower_rels, outerrel->relids));
+	Assert(bms_is_subset(fpinfo_i->subqspec.lower_rels, innerrel->relids));
+	fpinfo->subqspec.lower_rels = bms_union(fpinfo_o->subqspec.lower_rels,
+											fpinfo_i->subqspec.lower_rels);
+
+	/*
+	 * Pull the other remote conditions from the joining relations into join
+	 * clauses or other remote clauses (remote_conds) of this relation
+	 * wherever possible. This avoids building subqueries at every join step.
+	 *
+	 * For an inner join, clauses from both the relations are added to the
+	 * other remote clauses. For LEFT and RIGHT OUTER join, the clauses from
+	 * the outer side are added to remote_conds since those can be evaluated
+	 * after the join is evaluated. The clauses from inner side are added to
+	 * the joinclauses, since they need to be evaluated while constructing the
+	 * join.
+	 *
+	 * For a FULL OUTER JOIN, the other clauses from either relation can not
+	 * be added to the joinclauses or remote_conds, since each relation acts
+	 * as an outer relation for the other.
+	 *
+	 * The joining sides can not have local conditions, thus no need to test
+	 * shippability of the clauses being pulled up.
+	 */
+	switch (jointype)
+	{
+		case JOIN_INNER:
+			fpinfo->remote_conds = list_concat(fpinfo->remote_conds,
+										  list_copy(fpinfo_i->remote_conds));
+			fpinfo->remote_conds = list_concat(fpinfo->remote_conds,
+										  list_copy(fpinfo_o->remote_conds));
+			break;
+
+		case JOIN_LEFT:
+			fpinfo->joinspec.clauses = list_concat(fpinfo->joinspec.clauses,
+										  list_copy(fpinfo_i->remote_conds));
+			fpinfo->remote_conds = list_concat(fpinfo->remote_conds,
+										  list_copy(fpinfo_o->remote_conds));
+			break;
+
+		case JOIN_RIGHT:
+			fpinfo->joinspec.clauses = list_concat(fpinfo->joinspec.clauses,
+										  list_copy(fpinfo_o->remote_conds));
+			fpinfo->remote_conds = list_concat(fpinfo->remote_conds,
+										  list_copy(fpinfo_i->remote_conds));
+			break;
+
+		case JOIN_FULL:
+
+			/*
+			 * In this case, if any of the input relations has conditions,
+			 * we need to deparse that relation as a subquery so that the
+			 * conditions can be evaluated before the join.  Remember it in
+			 * the fpinfo of this relation so that the deparser can take
+			 * appropriate action.  Also, save the relids of base relations
+			 * covered by that relation for later use by the deparser.
+			 */
+			if (fpinfo_o->remote_conds)
+			{
+				fpinfo->subqspec.make_outerrel = true;
+				fpinfo->subqspec.lower_rels =
+					bms_add_members(fpinfo->subqspec.lower_rels,
+									outerrel->relids);
+			}
+			if (fpinfo_i->remote_conds)
+			{
+				fpinfo->subqspec.make_innerrel = true;
+				fpinfo->subqspec.lower_rels =
+					bms_add_members(fpinfo->subqspec.lower_rels,
+									innerrel->relids);
+			}
+			break;
+
+		default:
+			/* Should not happen, we have just check this above */
+			elog(ERROR, "unsupported join type %d", jointype);
+	}
+
+	/*
+	 * For an inner join, all restrictions can be treated alike. Treating the
+	 * pushed down conditions as join conditions allows a top level full outer
+	 * join to be deparsed without requiring subqueries.
+	 */
+	if (jointype == JOIN_INNER)
+	{
+		Assert(!fpinfo->joinspec.clauses);
+		fpinfo->joinspec.clauses = fpinfo->remote_conds;
+		fpinfo->remote_conds = NIL;
+	}
+
+	/* Mark that this join can be pushed down safely */
+	fpinfo->pushdown_safe = true;
+
+	/*
+	 * Set the string describing this join relation to be used in EXPLAIN
+	 * output of corresponding ForeignScan.
+	 */
+	fpinfo->relation_name = makeStringInfo();
+	appendStringInfo(fpinfo->relation_name, "(%s) %s JOIN (%s)",
+					 fpinfo_o->relation_name->data,
+					 get_jointype_name(fpinfo->joinspec.type),
+					 fpinfo_i->relation_name->data);
+
+	/*
+	 * Set the relation index.  This is defined as the position of this
+	 * joinrel in the join_rel_list list plus the length of the rtable list.
+	 * Note that since this joinrel is at the end of the join_rel_list list
+	 * when we are called, we can get the position by list_length.
+	 */
+	Assert(fpinfo->relation_index == 0);	/* shouldn't be set yet */
+	fpinfo->relation_index =
+		list_length(root->parse->rtable) + list_length(root->join_rel_list);
+
+	return true;
+}
+
+
+/*
+ * estimate_path_cost_size
+ *		Get cost and size estimates for a foreign scan on given foreign relation
+ *		either a base relation or a join between foreign relations or an upper
+ *		relation containing foreign relations.
+ *
+ * param_join_conds are the parameterization clauses with outer relations.
+ * pathkeys specify the expected sort order if any for given path being costed.
+ *
+ * The function returns the cost and size estimates in p_row, p_width,
+ * p_startup_cost and p_total_cost variables.
+ */
+static void
+estimate_path_cost_size(PlannerInfo *root,
+						RelOptInfo *foreignrel,
+						List *param_join_conds,
+						List *pathkeys,
+                        SqliteRelationCosts * store)
+{
+	SqliteFdwRelationInfo *fpinfo = (SqliteFdwRelationInfo *) foreignrel->fdw_private;
+    SqliteCostEstimates est = {0};
+
+    /*
+     * We don't support join conditions in this mode (hence, no
+     * parameterized paths can be made).
+     */
+    Assert(param_join_conds == NIL);
+
+    /*
+     * Use rows/width estimates made by set_baserel_size_estimates() for
+     * base foreign relations and set_joinrel_size_estimates() for join
+     * between foreign relations.
+     */
+    est.rows = foreignrel->rows;
+    est.width = foreignrel->reltarget->width;
+
+    /* Back into an estimate of the number of retrieved rows. */
+    est.retrieved_rows = clamp_row_est(est.rows / fpinfo->costs.local_conds_sel);
+
+    /*
+     * We will come here again and again with different set of pathkeys
+     * that caller wants to cost. We don't need to calculate the cost of
+     * bare scan each time. Instead, use the costs if we have cached them
+     * already.
+     */
+    if (fpinfo->costs.rel_startup_cost > 0 && fpinfo->costs.rel_total_cost > 0)
+    {
+        est.startup_cost = fpinfo->costs.rel_startup_cost;
+        est.run_cost = fpinfo->costs.rel_total_cost - est.startup_cost;
+    }
+    else if (IS_JOIN_REL(foreignrel))
+    {
+        estimate_join_rel_cost(root, foreignrel, &est);
+    }
+    else if (IS_UPPER_REL(foreignrel))
+    {
+        estimate_upper_rel_cost(root, foreignrel, &est);
+    }
+    else
+    {
+        estimate_base_rel_cost(root, foreignrel, &est);
+    }
+
+    /*
+     * Without remote estimates, we have no real way to estimate the cost
+     * of generating sorted output.  It could be free if the query plan
+     * the remote side would have chosen generates properly-sorted output
+     * anyway, but in most cases it will cost something.  Estimate a value
+     * high enough that we won't pick the sorted path when the ordering
+     * isn't locally useful, but low enough that we'll err on the side of
+     * pushing down the ORDER BY clause when it's useful to do so.
+     */
+    if (pathkeys != NIL)
+    {
+        est.startup_cost *= DEFAULT_FDW_SORT_MULTIPLIER;
+        est.run_cost *= DEFAULT_FDW_SORT_MULTIPLIER;
+    }
+
+	/*
+	 * Cache the costs for scans without any pathkeys or parameterization
+	 * before adding the costs for transferring data from the foreign server.
+	 * These costs are useful for costing the join between this relation and
+	 * another foreign relation or to calculate the costs of paths with
+	 * pathkeys for this relation, when the costs can not be obtained from the
+	 * foreign server. This function will be called at least once for every
+	 * foreign relation without pathkeys and parameterization.
+	 */
+	if (pathkeys == NIL && param_join_conds == NIL)
+	{
+		fpinfo->costs.rel_startup_cost = est.startup_cost;
+		fpinfo->costs.rel_total_cost = est.startup_cost + est.run_cost;
+	}
+	
+    // Connection overhead
+    est.startup_cost += fpinfo->costs.fdw_startup_cost;
+
+	/* Return results.
+     * Add all costs and account for network transfer and local manipulation
+     * of the rows
+	 * (fdw_tuple_cost per retrieved row), and local manipulation of the data
+	 * (cpu_tuple_cost per retrieved row).
+	*/
+    store->rows = est.rows;
+    store->width = est.width;
+    store->startup_cost = est.startup_cost;
+    store->total_cost = est.startup_cost + est.run_cost + 
+                        (fpinfo->costs.fdw_tuple_cost + cpu_tuple_cost) *
+                        est.retrieved_rows;
+}
+
+
+static void
+estimate_join_rel_cost(PlannerInfo *root,
+					   RelOptInfo *foreignrel,
+                       SqliteCostEstimates * est)
+{
+	SqliteFdwRelationInfo *fpinfo = (SqliteFdwRelationInfo *) foreignrel->fdw_private;
+    SqliteFdwRelationInfo *fpinfo_i;
+    SqliteFdwRelationInfo *fpinfo_o;
+    QualCost	join_cost;
+    QualCost	remote_conds_cost;
+    double		nrows;
+
+    /* For join we expect inner and outer relations set */
+    Assert(fpinfo->joinspec.innerrel && fpinfo->joinspec.outerrel);
+
+    fpinfo_i = (SqliteFdwRelationInfo *) fpinfo->joinspec.innerrel->fdw_private;
+    fpinfo_o = (SqliteFdwRelationInfo *) fpinfo->joinspec.outerrel->fdw_private;
+
+    /* Estimate of number of rows in cross product */
+    nrows = fpinfo_i->costs.rows * fpinfo_o->costs.rows;
+    /* Clamp retrieved rows estimate to at most size of cross product */
+    est->retrieved_rows = Min(est->retrieved_rows, nrows);
+
+    /*
+     * The cost of foreign join is estimated as cost of generating
+     * rows for the joining relations + cost for applying quals on the
+     * rows.
+     */
+
+    /*
+     * Calculate the cost of clauses pushed down to the foreign server
+     */
+    cost_qual_eval(&remote_conds_cost, fpinfo->remote_conds, root);
+    /* Calculate the cost of applying join clauses */
+    cost_qual_eval(&join_cost, fpinfo->joinspec.clauses, root);
+
+    /*
+     * Startup cost includes startup cost of joining relations and the
+     * startup cost for join and other clauses. We do not include the
+     * startup cost specific to join strategy (e.g. setting up hash
+     * tables) since we do not know what strategy the foreign server
+     * is going to use.
+     */
+    est->startup_cost = fpinfo_i->costs.rel_startup_cost + fpinfo_o->costs.rel_startup_cost;
+    est->startup_cost += join_cost.startup;
+    est->startup_cost += remote_conds_cost.startup;
+    est->startup_cost += fpinfo->costs.local_conds_cost.startup;
+
+    /*
+     * Run time cost includes:
+     *
+     * 1. Run time cost (total_cost - startup_cost) of relations being
+     * joined
+     *
+     * 2. Run time cost of applying join clauses on the cross product
+     * of the joining relations.
+     *
+     * 3. Run time cost of applying pushed down other clauses on the
+     * result of join
+     *
+     * 4. Run time cost of applying nonpushable other clauses locally
+     * on the result fetched from the foreign server.
+     */
+    est->run_cost = fpinfo_i->costs.rel_total_cost - fpinfo_i->costs.rel_startup_cost;
+    est->run_cost += fpinfo_o->costs.rel_total_cost - fpinfo_o->costs.rel_startup_cost;
+    est->run_cost += nrows * join_cost.per_tuple;
+    nrows = clamp_row_est(nrows * fpinfo->joinspec.clause_sel);
+    est->run_cost += nrows * remote_conds_cost.per_tuple;
+    est->run_cost += fpinfo->costs.local_conds_cost.per_tuple * est->retrieved_rows;
+}
+
+    
+static void
+estimate_upper_rel_cost(PlannerInfo *root,
+					    RelOptInfo *foreignrel,
+                        SqliteCostEstimates * est)
+{
+	SqliteFdwRelationInfo *fpinfo = (SqliteFdwRelationInfo *) foreignrel->fdw_private;
+    SqliteFdwRelationInfo *ofpinfo;
+    PathTarget *ptarget = root->upper_targets[UPPERREL_GROUP_AGG];
+    AggClauseCosts aggcosts;
+    double		input_rows;
+    int			numGroupCols;
+    double		numGroups = 1;
+
+    /*
+     * This cost model is mixture of costing done for sorted and
+     * hashed aggregates in cost_agg().  We are not sure which
+     * strategy will be considered at remote side, thus for
+     * simplicity, we put all startup related costs in startup_cost
+     * and all finalization and run cost are added in total_cost.
+     *
+     * Also, core does not care about costing HAVING expressions and
+     * adding that to the costs.  So similarly, here too we are not
+     * considering remote and local conditions for costing.
+     */
+
+    ofpinfo = (SqliteFdwRelationInfo *) fpinfo->joinspec.outerrel->fdw_private;
+
+    /* Get rows and width from input rel */
+    input_rows = ofpinfo->costs.rows;
+    // width = ofpinfo->cost.width;
+
+    /* Collect statistics about aggregates for estimating costs. */
+    MemSet(&aggcosts, 0, sizeof(AggClauseCosts));
+    if (root->parse->hasAggs)
+    {
+        get_agg_clause_costs(root, (Node *) fpinfo->grouped_tlist,
+                             AGGSPLIT_SIMPLE, &aggcosts);
+        get_agg_clause_costs(root, (Node *) root->parse->havingQual,
+                             AGGSPLIT_SIMPLE, &aggcosts);
+    }
+
+    /* Get number of grouping columns and possible number of groups */
+    numGroupCols = list_length(root->parse->groupClause);
+    numGroups = estimate_num_groups(root,
+                    get_sortgrouplist_exprs(root->parse->groupClause,
+                                            fpinfo->grouped_tlist),
+                                    input_rows, NULL);
+
+    /*
+     * Number of rows expected from foreign server will be same as
+     * that of number of groups.
+     */
+    est->rows = est->retrieved_rows = numGroups;
+
+    /*-----
+     * Startup cost includes:
+     *	  1. Startup cost for underneath input * relation
+     *	  2. Cost of performing aggregation, per cost_agg()
+     *	  3. Startup cost for PathTarget eval
+     *-----
+     */
+    est->startup_cost = ofpinfo->costs.rel_startup_cost;
+    est->startup_cost += aggcosts.transCost.startup;
+    est->startup_cost += aggcosts.transCost.per_tuple * input_rows;
+    est->startup_cost += (cpu_operator_cost * numGroupCols) * input_rows;
+    est->startup_cost += ptarget->cost.startup;
+
+    /*-----
+     * Run time cost includes:
+     *	  1. Run time cost of underneath input relation
+     *	  2. Run time cost of performing aggregation, per cost_agg()
+     *	  3. PathTarget eval cost for each output row
+     *-----
+     */
+    est->run_cost = ofpinfo->costs.rel_total_cost - ofpinfo->costs.rel_startup_cost;
+    est->run_cost += aggcosts.finalCost * numGroups;
+    est->run_cost += cpu_tuple_cost * numGroups;
+    est->run_cost += ptarget->cost.per_tuple * numGroups;
+}
+
+    
+static void
+estimate_base_rel_cost(PlannerInfo *root,
+					    RelOptInfo *foreignrel,
+                        SqliteCostEstimates * est)
+{
+	Cost	cpu_per_tuple = cpu_tuple_cost + 
+                            foreignrel->baserestrictcost.per_tuple;
+    
+    /* Clamp retrieved rows estimates to at most foreignrel->tuples. */
+    est->retrieved_rows = Min(est->retrieved_rows, foreignrel->tuples);
+
+    /*
+     * Cost as though this were a seqscan, which is pessimistic.  We
+     * effectively imagine the local_conds are being evaluated
+     * remotely, too.
+     */
+    est->startup_cost = 0;
+    est->run_cost = 0;
+    est->run_cost += seq_page_cost * foreignrel->pages;
+
+    est->startup_cost += foreignrel->baserestrictcost.startup;
+    est->run_cost += cpu_per_tuple * foreignrel->tuples;
+}
+
+    
+static void
+add_paths_with_pathkeys_for_rel(PlannerInfo *root, RelOptInfo *rel,
+								Path *epq_path)
+{
+	List	   *useful_pathkeys_list = NIL;		/* List of all pathkeys */
+	ListCell   *lc;
+
+	useful_pathkeys_list = get_useful_pathkeys_for_relation(root, rel);
+
+	/* Create one path for each set of pathkeys we found above. */
+	foreach(lc, useful_pathkeys_list)
+	{
+		List	   *useful_pathkeys = lfirst(lc);
+        SqliteRelationCosts costs;
+		estimate_path_cost_size(root, rel, NIL, useful_pathkeys, &costs);
+		add_path(rel, (Path *)
+				 create_foreignscan_path(root, rel,
+										 NULL,
+										 costs.rows,
+										 costs.startup_cost,
+										 costs.total_cost,
+										 useful_pathkeys,
+										 NULL,
+										 epq_path,
+										 NIL));
+	}
+}
+
+
+/* Output join name for given join type */
+static const char *
+get_jointype_name(JoinType jointype)
+{
+	switch (jointype)
+	{
+		case JOIN_INNER:
+			return "INNER";
+
+		case JOIN_LEFT:
+			return "LEFT";
+
+		case JOIN_RIGHT:
+			return "RIGHT";
+
+		case JOIN_FULL:
+			return "FULL";
+
+		default:
+			/* Shouldn't come here, but protect from buggy code. */
+			elog(ERROR, "unsupported join type %d", jointype);
+	}
+
+	/* Keep compiler happy */
+	return NULL;
+}
+
+
+/*
+ * get_useful_pathkeys_for_relation
+ *		Determine which orderings of a relation might be useful.
+ *
+ * Getting data in sorted order can be useful either because the requested
+ * order matches the final output ordering for the overall query we're
+ * planning, or because it enables an efficient merge join.  Here, we try
+ * to figure out which pathkeys to consider.
+ */
+static List *
+get_useful_pathkeys_for_relation(PlannerInfo *root, RelOptInfo *rel)
+{
+	List	   *useful_pathkeys_list = NIL;
+	ListCell   *lc;
+
+	/*
+	 * Pushing the query_pathkeys to the remote server is always worth
+	 * considering, because it might let us avoid a local sort.
+	 */
+	if (root->query_pathkeys)
+	{
+		bool		query_pathkeys_ok = true;
+
+		foreach(lc, root->query_pathkeys)
+		{
+			PathKey    *pathkey = (PathKey *) lfirst(lc);
+			EquivalenceClass *pathkey_ec = pathkey->pk_eclass;
+			Expr	   *em_expr;
+
+			/*
+			 * The planner and executor don't have any clever strategy for
+			 * taking data sorted by a prefix of the query's pathkeys and
+			 * getting it to be sorted by all of those pathkeys. We'll just
+			 * end up resorting the entire data set.  So, unless we can push
+			 * down all of the query pathkeys, forget it.
+			 *
+			 * is_foreign_expr would detect volatile expressions as well, but
+			 * checking ec_has_volatile here saves some cycles.
+			 */
+			if (pathkey_ec->ec_has_volatile ||
+				!(em_expr = find_em_expr_for_rel(pathkey_ec, rel)) ||
+				!is_foreignExpr(root, rel, em_expr))
+			{
+				query_pathkeys_ok = false;
+				break;
+			}
+		}
+
+		if (query_pathkeys_ok)
+			useful_pathkeys_list = list_make1(list_copy(root->query_pathkeys));
+	}
+
+	/*
+	 * Even if we're not using remote estimates, having the remote side do the
+	 * sort generally won't be any worse than doing it locally, and it might
+	 * be much better if the remote side can generate data in the right order
+	 * without needing a sort at all.  However, what we're going to do next is
+	 * try to generate pathkeys that seem promising for possible merge joins,
+	 * and that's more speculative.  A wrong choice might hurt quite a bit, so
+	 * bail out if we can't use remote estimates.
+	 */
+    return useful_pathkeys_list;
+}
+
+
+/*
+ * Find an equivalence class member expression, all of whose Vars, come from
+ * the indicated relation.
+ */
+static Expr *
+find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel)
+{
+	ListCell   *lc_em;
+
+	foreach(lc_em, ec->ec_members)
+	{
+		EquivalenceMember *em = lfirst(lc_em);
+
+		if (bms_is_subset(em->em_relids, rel->relids))
+		{
+			/*
+			 * If there is more than one equivalence member whose Vars are
+			 * taken entirely from this relation, we'll be content to choose
+			 * any one of those.
+			 */
+			return em->em_expr;
+		}
+	}
+
+	/* We didn't find any suitable equivalence class expression */
+	return NULL;
+}
+
+
+/*
+ * Detect whether we want to process an EquivalenceClass member.
+ *
+ * This is a callback for use by generate_implied_equalities_for_column.
+ */
+static bool
+ec_member_matches_foreign(PlannerInfo *root, RelOptInfo *rel,
+						  EquivalenceClass *ec, EquivalenceMember *em,
+						  void *arg)
+{
+	ec_member_foreign_arg *state = (ec_member_foreign_arg *) arg;
+	Expr	   *expr = em->em_expr;
+
+	/*
+	 * If we've identified what we're processing in the current scan, we only
+	 * want to match that expression.
+	 */
+	if (state->current != NULL)
+		return equal(expr, state->current);
+
+	/*
+	 * Otherwise, ignore anything we've already processed.
+	 */
+	if (list_member(state->already_used, expr))
+		return false;
+
+	/* This is the new target to process. */
+	state->current = expr;
+	return true;
 }

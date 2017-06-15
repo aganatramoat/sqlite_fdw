@@ -33,6 +33,7 @@ typedef struct DeparseExprCxt__
 {
 	PlannerInfo *root;		/* global planner state */
 	RelOptInfo *foreignrel;	/* the foreign relation we are planning for */
+    RelOptInfo *scanrel;
 	StringInfo	buf;		/* output buffer to append to */
 	List	**params_list;	/* exprs that will become remote Params */
 } DeparseExprCxt__;
@@ -228,32 +229,229 @@ deparse_targetList__(StringInfo buf,
 }
 
 
-void
-deparse_selectStmt(StringInfo buf,
-				 PlannerInfo *root,
-				 RelOptInfo *baserel,
-				 Bitmapset *attrs_used,
-				 char *svr_table, List **retrieved_attrs)
+/*
+ * Deparse given targetlist and append it to context->buf.
+ *
+ * tlist is list of TargetEntry's which in turn contain Var nodes.
+ *
+ * retrieved_attrs is the list of continuously increasing integers starting
+ * from 1. It has same number of entries as tlist.
+ */
+static void
+deparseExplicitTargetList(List *tlist, List **retrieved_attrs,
+						  deparse_expr_cxt *context)
 {
-	RangeTblEntry *rte = planner_rt_fetch(baserel->relid, root);
-	Relation	rel;
+	ListCell   *lc;
+	StringInfo	buf = context->buf;
+	int			i = 0;
 
-	/*
-	 * Core code already has some lock on each rel being planned, so we can
-	 * use NoLock here.
-	 */
-	rel = heap_open(rte->relid, NoLock);
+	*retrieved_attrs = NIL;
 
-	appendStringInfoString(buf, "SELECT ");
-	deparse_targetList__(buf, root, baserel->relid, rel, attrs_used, retrieved_attrs);
+	foreach(lc, tlist)
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
 
-	/*
-	 * Construct FROM clause
-	 */
-	appendStringInfoString(buf, " FROM ");
-	deparse_relaltion__(buf, rel);
-	heap_close(rel, NoLock);
+		if (i > 0)
+			appendStringInfoString(buf, ", ");
+		deparseExpr((Expr *) tle->expr, context);
+
+		*retrieved_attrs = lappend_int(*retrieved_attrs, i + 1);
+		i++;
+	}
+
+	if (i == 0)
+		appendStringInfoString(buf, "NULL");
 }
+
+
+/*
+ * Emit expressions specified in the given relation's reltarget.
+ *
+ * This is used for deparsing the given relation as a subquery.
+ */
+static void
+deparseSubqueryTargetList(DeparseExprCxt__ *context)
+{
+	StringInfo	buf = context->buf;
+	RelOptInfo *foreignrel = context->foreignrel;
+	bool		first;
+	ListCell   *lc;
+
+	/* Should only be called in these cases. */
+	Assert(IS_SIMPLE_REL(foreignrel) || IS_JOIN_REL(foreignrel));
+
+	first = true;
+	foreach(lc, foreignrel->reltarget->exprs)
+	{
+		Node	   *node = (Node *) lfirst(lc);
+
+		if (!first)
+			appendStringInfoString(buf, ", ");
+		first = false;
+
+		deparse_expr__((Expr *) node, context);
+	}
+
+	/* Don't generate bad syntax if no expressions */
+	if (first)
+		appendStringInfoString(buf, "NULL");
+}
+
+/*
+ * Construct a simple SELECT statement that retrieves desired columns
+ * of the specified foreign table, and append it to "buf".  The output
+ * contains just "SELECT ... ".
+ *
+ * We also create an integer List of the columns being retrieved, which is
+ * returned to *retrieved_attrs, unless we deparse the specified relation
+ * as a subquery.
+ *
+ * tlist is the list of desired columns.  is_subquery is the flag to
+ * indicate whether to deparse the specified relation as a subquery.
+ * Read prologue of deparseSelectStmtForRel() for details.
+ */
+static void
+deparseSelectSql(List *tlist, bool is_subquery, List **retrieved_attrs,
+				 DeparseExprCxt__ *context)
+{
+	StringInfo	buf = context->buf;
+	RelOptInfo *foreignrel = context->foreignrel;
+	PlannerInfo *root = context->root;
+	SqliteFdwRelationInfo *fpinfo = (SqliteFdwRelationInfo *) 
+                                    foreignrel->fdw_private;
+
+	/*
+	 * Construct SELECT list
+	 */
+	appendStringInfoString(buf, "SELECT ");
+
+	if (is_subquery)
+	{
+		/*
+		 * For a relation that is deparsed as a subquery, emit expressions
+		 * specified in the relation's reltarget.  Note that since this is
+		 * for the subquery, no need to care about *retrieved_attrs.
+		 */
+		deparseSubqueryTargetList(context);
+	}
+	else if (IS_JOIN_REL(foreignrel) || IS_UPPER_REL(foreignrel))
+	{
+		/*
+		 * For a join or upper relation the input tlist gives the list of
+		 * columns required to be fetched from the foreign server.
+		 */
+		deparseExplicitTargetList(tlist, retrieved_attrs, context);
+	}
+	else
+	{
+		/*
+		 * For a base relation fpinfo->attrs_used gives the list of columns
+		 * required to be fetched from the foreign server.
+		 */
+		RangeTblEntry *rte = planner_rt_fetch(foreignrel->relid, root);
+
+		/*
+		 * Core code already has some lock on each rel being planned, so we
+		 * can use NoLock here.
+		 */
+		Relation	rel = heap_open(rte->relid, NoLock);
+
+		deparse_targetList__(buf, root, foreignrel->relid, rel, false,
+						     fpinfo->attrs_used, false, retrieved_attrs);
+		heap_close(rel, NoLock);
+	}
+}
+
+/*
+ * Deparse SELECT statement for given relation into buf.
+ *
+ * tlist contains the list of desired columns to be fetched from foreign server.
+ * For a base relation fpinfo->attrs_used is used to construct SELECT clause,
+ * hence the tlist is ignored for a base relation.
+ *
+ * remote_conds is the list of conditions to be deparsed into the WHERE clause
+ * (or, in the case of upper relations, into the HAVING clause).
+ *
+ * If params_list is not NULL, it receives a list of Params and other-relation
+ * Vars used in the clauses; these values must be transmitted to the remote
+ * server as parameter values.
+ *
+ * If params_list is NULL, we're generating the query for EXPLAIN purposes,
+ * so Params and other-relation Vars should be replaced by dummy values.
+ *
+ * pathkeys is the list of pathkeys to order the result by.
+ *
+ * is_subquery is the flag to indicate whether to deparse the specified
+ * relation as a subquery.
+ *
+ * List of columns selected is returned in retrieved_attrs.
+ */
+extern void
+deparse_selectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
+						 List *tlist, List *remote_conds, List *pathkeys,
+						 bool is_subquery, List **retrieved_attrs,
+						 List **params_list)
+{
+	DeparseExprCxt__ context;
+	SqliteFdwRelationInfo *fpinfo = (SqliteFdwRelationInfo *) rel->fdw_private;
+	List	   *quals;
+
+	/*
+	 * We handle relations for foreign tables, joins between those and upper
+	 * relations.
+	 */
+	Assert(IS_JOIN_REL(rel) || IS_SIMPLE_REL(rel) || IS_UPPER_REL(rel));
+
+	/* Fill portions of context common to upper, join and base relation */
+	context.buf = buf;
+	context.root = root;
+	context.foreignrel = rel;
+	context.scanrel = IS_UPPER_REL(rel) ? fpinfo->joinspec.outerrel : rel;
+	context.params_list = params_list;
+
+	/* Construct SELECT clause */
+	deparseSelectSql(tlist, is_subquery, retrieved_attrs, &context);
+
+	/*
+	 * For upper relations, the WHERE clause is built from the remote
+	 * conditions of the underlying scan relation; otherwise, we can use the
+	 * supplied list of remote conditions directly.
+	 */
+	if (IS_UPPER_REL(rel))
+	{
+		PgFdwRelationInfo *ofpinfo;
+
+		ofpinfo = (PgFdwRelationInfo *) fpinfo->outerrel->fdw_private;
+		quals = ofpinfo->remote_conds;
+	}
+	else
+		quals = remote_conds;
+
+	/* Construct FROM and WHERE clauses */
+	deparseFromExpr(quals, &context);
+
+	if (IS_UPPER_REL(rel))
+	{
+		/* Append GROUP BY clause */
+		appendGroupByClause(tlist, &context);
+
+		/* Append HAVING clause */
+		if (remote_conds)
+		{
+			appendStringInfo(buf, " HAVING ");
+			appendConditions(remote_conds, &context);
+		}
+	}
+
+	/* Add ORDER BY clause if we found any useful pathkeys */
+	if (pathkeys)
+		appendOrderByClause(pathkeys, &context);
+
+	/* Add any necessary FOR UPDATE/SHARE. */
+	deparseLockingClause(&context);
+}
+
+
 
 
 /*

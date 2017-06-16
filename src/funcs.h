@@ -1,19 +1,7 @@
 #ifndef SQLITE_FDW_FUNCS_H
 #define SQLITE_FDW_FUNCS_H
 
-typedef struct SqliteTableImportOptions
-{
-    bool import_notnull;
-    bool import_default;
-} SqliteTableImportOptions;
-
-
-typedef struct SqliteTableSource
-{
-    char   *database;
-    char   *table;
-} SqliteTableSource;
-
+#include "sqlite_fdw.h"
 
 bool is_sqliteTableRequired(ImportForeignSchemaStmt *stmt, 
                             char const * tablename);

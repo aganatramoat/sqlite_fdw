@@ -15,6 +15,7 @@
  */
 
 #include <postgres.h>
+#include <miscadmin.h>
 
 #include <access/reloptions.h>
 #include <access/htup_details.h>
@@ -39,6 +40,7 @@
 #include <utils/builtins.h>
 #include <utils/formatting.h>
 #include <utils/rel.h>
+#include <utils/guc.h>
 #include <utils/selfuncs.h>
 #include <utils/lsyscache.h>
 #include <utils/memutils.h>
@@ -147,7 +149,6 @@ static void estimate_path_cost_size(PlannerInfo *root,
 static void add_paths_with_pathkeys_for_rel(PlannerInfo *root, 
                                             RelOptInfo *rel,
 								            Path *epq_path);
-static const char * get_jointype_name(JoinType jointype);
 static void estimate_join_rel_cost(PlannerInfo *root,
 					               RelOptInfo *foreignrel,
                                    SqliteCostEstimates * est);
@@ -159,14 +160,9 @@ static void estimate_base_rel_cost(PlannerInfo *root,
                                     SqliteCostEstimates * est);
 static List * get_useful_pathkeys_for_relation(PlannerInfo *root, 
                                                RelOptInfo *rel);
-static Expr * find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel);
 static bool ec_member_matches_foreign(PlannerInfo *root, RelOptInfo *rel,
 						  EquivalenceClass *ec, EquivalenceMember *em,
 						  void *arg);
-
-/*
- * structures used by the FDW
- */
 
 /*
  * Describes the valid options for objects that use this wrapper.
@@ -393,7 +389,7 @@ sqliteGetForeignRelSize(PlannerInfo *root,
 	{
 		RestrictInfo *ri = (RestrictInfo *) lfirst(lc);
 
-		if (is_foreignExpr(root, baserel, ri->clause))
+		if (is_foreign_expr(root, baserel, ri->clause))
 			fpinfo->remote_conds = lappend(fpinfo->remote_conds, ri);
 		else
 			fpinfo->local_conds = lappend(fpinfo->local_conds, ri);
@@ -535,7 +531,7 @@ sqliteGetForeignPaths(PlannerInfo *root,
 			continue;
 
 		/* See if it is safe to send to remote */
-		if (!is_foreignExpr(root, baserel, rinfo->clause))
+		if (!is_foreign_expr(root, baserel, rinfo->clause))
 			continue;
 
 		/* Calculate required outer rels for the resulting path */
@@ -611,7 +607,7 @@ sqliteGetForeignPaths(PlannerInfo *root,
 					continue;
 
 				/* See if it is safe to send to remote */
-				if (!is_foreignExpr(root, baserel, rinfo->clause))
+				if (!is_foreign_expr(root, baserel, rinfo->clause))
 					continue;
 
 				/* Calculate required outer rels for the resulting path */
@@ -718,7 +714,7 @@ get_foreignPlanSimple__(PlannerInfo *root,
 			continue;
 
 		if ( list_member_ptr(fpinfo->remote_conds, rinfo) ||
-             is_foreignExpr(root, baserel, rinfo->clause) )
+             is_foreign_expr(root, baserel, rinfo->clause) )
 		{
 			remote_conds = lappend(remote_conds, rinfo);
 			remote_exprs = lappend(remote_exprs, rinfo->clause);
@@ -729,19 +725,10 @@ get_foreignPlanSimple__(PlannerInfo *root,
 	
     /* Build the query */
 	initStringInfo(&sql);
-    deparse_selectStmt(&sql, root, baserel, fpinfo->attrs_used, 
-                          fpinfo->src.table, &retrieved_attrs);
+	deparseSelectStmtForRel(&sql, root, baserel, NULL,
+							remote_exprs, best_path->path.pathkeys,
+							false, &retrieved_attrs, &params_list);
 
-	if (remote_conds)
-		append_whereClause(&sql, root, baserel, remote_conds,
-						           true, &params_list);
-	
-    if (baserel->relid == root->parse->resultRelation &&
-		(root->parse->commandType == CMD_UPDATE ||
-		root->parse->commandType == CMD_DELETE))
-			/* Relation is UPDATE/DELETE target, so use FOR UPDATE */
-			appendStringInfoString(&sql, " FOR UPDATE");
-	
     /*   The sql query and the attributes are salted away
      *   Will be used later in BeginForeignScan
      */
@@ -766,48 +753,6 @@ get_foreignPlanSimple__(PlannerInfo *root,
 	                       );
 }
 
-
-/*
- * Build the targetlist for given relation to be deparsed as SELECT clause.
- *
- * The output targetlist contains the columns that need to be fetched from the
- * foreign server for the given relation.  If foreignrel is an upper relation,
- * then the output targetlist can also contain expressions to be evaluated on
- * foreign server.
- */
-static List *
-build_tlist_to_deparse(RelOptInfo *foreignrel)
-{
-	List	   *tlist = NIL;
-	SqliteFdwRelationInfo *fpinfo = (SqliteFdwRelationInfo *) 
-                                     foreignrel->fdw_private;
-	ListCell   *lc;
-
-	/*
-	 * For an upper relation, we have already built the target list while
-	 * checking shippability, so just return that.
-	 */
-	if (IS_UPPER_REL(foreignrel))
-		return fpinfo->grouped_tlist;
-
-	/*
-	 * We require columns specified in foreignrel->reltarget->exprs and those
-	 * required for evaluating the local conditions.
-	 */
-	tlist = add_to_flat_tlist(tlist,
-					   pull_var_clause((Node *) foreignrel->reltarget->exprs,
-									   PVC_RECURSE_PLACEHOLDERS));
-	foreach(lc, fpinfo->local_conds)
-	{
-		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
-
-		tlist = add_to_flat_tlist(tlist,
-								  pull_var_clause((Node *) rinfo->clause,
-												  PVC_RECURSE_PLACEHOLDERS));
-	}
-
-	return tlist;
-}
 
     
 static ForeignScan *
@@ -837,6 +782,7 @@ get_foreignPlanJoinUpper__(PlannerInfo *root,
      */
     remote_exprs = extract_actual_clauses(fpinfo->remote_conds, false);
     local_exprs = extract_actual_clauses(fpinfo->local_conds, false);
+    remote_exprs++;
 
     /*
      * We leave fdw_recheck_quals empty in this case, since we never need
@@ -889,15 +835,7 @@ get_foreignPlanJoinUpper__(PlannerInfo *root,
                                                   qual);
         }
     }
-	return make_foreignscan(tlist,
-	                        local_exprs,
-	                        0,
-	                        params_list,
-	                        fdw_private,
-	                        fdw_scan_tlist,
-	                        NULL,
-	                        outer_plan
-	                       );
+    return NULL;
 }
 
 
@@ -1765,7 +1703,7 @@ sqliteGetForeignJoinPaths(PlannerInfo *root,
     
     elog(SQLITE_FDW_LOG_LEVEL,"XXXXXXXX GetForeignJoinPaths 3 %d", 
                 getpid());
-    raise(SIGSTOP);
+    /// raise(SIGSTOP);
 
 	/* XXX Consider parameterized paths for the join relation */
 }
@@ -1843,8 +1781,8 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 	foreach(lc, extra->restrictlist)
 	{
 		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
-		bool		is_remote_clause = is_foreignExpr(root, joinrel,
-													  rinfo->clause);
+		bool		is_remote_clause = is_foreign_expr(root, joinrel,
+													   rinfo->clause);
 
 		if (IS_OUTER_JOIN(jointype) && !rinfo->is_pushed_down)
 		{
@@ -2331,33 +2269,6 @@ add_paths_with_pathkeys_for_rel(PlannerInfo *root, RelOptInfo *rel,
 }
 
 
-/* Output join name for given join type */
-static const char *
-get_jointype_name(JoinType jointype)
-{
-	switch (jointype)
-	{
-		case JOIN_INNER:
-			return "INNER";
-
-		case JOIN_LEFT:
-			return "LEFT";
-
-		case JOIN_RIGHT:
-			return "RIGHT";
-
-		case JOIN_FULL:
-			return "FULL";
-
-		default:
-			/* Shouldn't come here, but protect from buggy code. */
-			elog(ERROR, "unsupported join type %d", jointype);
-	}
-
-	/* Keep compiler happy */
-	return NULL;
-}
-
 
 /*
  * get_useful_pathkeys_for_relation
@@ -2400,7 +2311,7 @@ get_useful_pathkeys_for_relation(PlannerInfo *root, RelOptInfo *rel)
 			 */
 			if (pathkey_ec->ec_has_volatile ||
 				!(em_expr = find_em_expr_for_rel(pathkey_ec, rel)) ||
-				!is_foreignExpr(root, rel, em_expr))
+				!is_foreign_expr(root, rel, em_expr))
 			{
 				query_pathkeys_ok = false;
 				break;
@@ -2423,34 +2334,6 @@ get_useful_pathkeys_for_relation(PlannerInfo *root, RelOptInfo *rel)
     return useful_pathkeys_list;
 }
 
-
-/*
- * Find an equivalence class member expression, all of whose Vars, come from
- * the indicated relation.
- */
-static Expr *
-find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel)
-{
-	ListCell   *lc_em;
-
-	foreach(lc_em, ec->ec_members)
-	{
-		EquivalenceMember *em = lfirst(lc_em);
-
-		if (bms_is_subset(em->em_relids, rel->relids))
-		{
-			/*
-			 * If there is more than one equivalence member whose Vars are
-			 * taken entirely from this relation, we'll be content to choose
-			 * any one of those.
-			 */
-			return em->em_expr;
-		}
-	}
-
-	/* We didn't find any suitable equivalence class expression */
-	return NULL;
-}
 
 
 /*
@@ -2482,4 +2365,84 @@ ec_member_matches_foreign(PlannerInfo *root, RelOptInfo *rel,
 	/* This is the new target to process. */
 	state->current = expr;
 	return true;
+}
+
+
+/*
+ * Force assorted GUC parameters to settings that ensure that we'll output
+ * data values in a form that is unambiguous to the remote server.
+ *
+ * This is rather expensive and annoying to do once per row, but there's
+ * little choice if we want to be sure values are transmitted accurately;
+ * we can't leave the settings in place between rows for fear of affecting
+ * user-visible computations.
+ *
+ * We use the equivalent of a function SET option to allow the settings to
+ * persist only until the caller calls reset_transmission_modes().  If an
+ * error is thrown in between, guc.c will take care of undoing the settings.
+ *
+ * The return value is the nestlevel that must be passed to
+ * reset_transmission_modes() to undo things.
+ */
+int
+set_transmission_modes(void)
+{
+	int			nestlevel = NewGUCNestLevel();
+
+	/*
+	 * The values set here should match what pg_dump does.  See also
+	 * configure_remote_session in connection.c.
+	 */
+	if (DateStyle != USE_ISO_DATES)
+		(void) set_config_option("datestyle", "ISO",
+								 PGC_USERSET, PGC_S_SESSION,
+								 GUC_ACTION_SAVE, true, 0, false);
+	if (IntervalStyle != INTSTYLE_POSTGRES)
+		(void) set_config_option("intervalstyle", "postgres",
+								 PGC_USERSET, PGC_S_SESSION,
+								 GUC_ACTION_SAVE, true, 0, false);
+	if (extra_float_digits < 3)
+		(void) set_config_option("extra_float_digits", "3",
+								 PGC_USERSET, PGC_S_SESSION,
+								 GUC_ACTION_SAVE, true, 0, false);
+
+	return nestlevel;
+}
+
+/*
+ * Undo the effects of set_transmission_modes().
+ */
+void
+reset_transmission_modes(int nestlevel)
+{
+	AtEOXact_GUC(true, nestlevel);
+}
+
+
+/*
+ * Find an equivalence class member expression, all of whose Vars, come from
+ * the indicated relation.
+ */
+extern Expr *
+find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel)
+{
+	ListCell   *lc_em;
+
+	foreach(lc_em, ec->ec_members)
+	{
+		EquivalenceMember *em = lfirst(lc_em);
+
+		if (bms_is_subset(em->em_relids, rel->relids))
+		{
+			/*
+			 * If there is more than one equivalence member whose Vars are
+			 * taken entirely from this relation, we'll be content to choose
+			 * any one of those.
+			 */
+			return em->em_expr;
+		}
+	}
+
+	/* We didn't find any suitable equivalence class expression */
+	return NULL;
 }

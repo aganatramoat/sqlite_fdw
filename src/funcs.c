@@ -15,9 +15,7 @@
 
 #include <sqlite3.h>
 
-#include "sqlite_fdw.h"
 #include "sqlite_private.h"
-#include "funcs.h"
 
 
 static char const * translate_sqliteType__(char const * type);
@@ -802,4 +800,71 @@ is_foreign_expr(PlannerInfo *root,
 
 	/* OK to evaluate on the remote server */
 	return true;
+}
+
+    
+void
+sqlite_bind_param_value(SqliteFdwExecutionState *festate,
+                        int index, 
+                        Oid ptype, 
+                        Datum pval, 
+                        bool isNull)
+{
+    int rc;
+	Oid   typoutput;
+	bool  typIsVarlena;
+    sqlite3_stmt *stmt = festate->stmt;
+    
+    if ( isNull ) 
+        rc = sqlite3_bind_null(stmt, index);
+    else
+        switch(ptype)
+        {
+            case INT2OID:
+                rc = sqlite3_bind_int(stmt, index, DatumGetInt16(pval));
+                break;
+            
+            case INT4OID:
+                rc = sqlite3_bind_int(stmt, index, DatumGetInt32(pval));
+                break;
+            
+            case INT8OID:
+                rc = sqlite3_bind_int64(stmt, index, DatumGetInt64(pval));
+                break;
+
+            case FLOAT4OID:
+                rc = sqlite3_bind_double(stmt, index, DatumGetFloat4(pval));
+                break;
+
+            case FLOAT8OID:
+                rc = sqlite3_bind_double(stmt, index, DatumGetFloat8(pval));
+                break;
+
+            case BOOLOID:
+                rc = sqlite3_bind_int(stmt, index, DatumGetBool(pval) ? 1 : 0);
+                break;
+
+            case BYTEAOID:
+                rc = sqlite3_bind_blob(
+                        stmt, index, 
+                        VARDATA(DatumGetPointer(pval)),
+                        VARSIZE(DatumGetPointer(pval)), SQLITE_TRANSIENT);
+                break;
+
+            default:
+	            getTypeOutputInfo(ptype, &typoutput, &typIsVarlena);
+                rc = sqlite3_bind_text(
+                            stmt, index, 
+                            OidOutputFunctionCall(typoutput, pval), 
+                            -1, SQLITE_TRANSIENT);
+                break;
+        }
+
+    if ( rc != SQLITE_OK ) {
+        ereport(ERROR,
+            (errcode(ERRCODE_FDW_ERROR),
+            errmsg("error while trying to bind param \"%s\"", 
+                        sqlite3_errmsg(festate->db))
+            ));
+    }
 }

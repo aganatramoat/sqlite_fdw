@@ -244,6 +244,8 @@ char *get_foreignTableCreationSql(ImportForeignSchemaStmt *stmt,
                                   SqliteTableImportOptions options);
 SqliteTableImportOptions get_sqliteTableImportOptions(
         ImportForeignSchemaStmt *stmt);
+void sqlite_bind_param_value(SqliteFdwExecutionState *festate,
+                        int index, Oid ptype, Datum pval, bool isNull);
 
 
 #pragma GCC visibility pop

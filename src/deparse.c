@@ -47,6 +47,7 @@
 #include "foreign/foreign.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
+#include "nodes/execnodes.h"
 #include "nodes/plannodes.h"
 #include "optimizer/clauses.h"
 #include "optimizer/prep.h"
@@ -59,41 +60,8 @@
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 
-#include "sqlite_fdw.h"
 #include "sqlite_private.h"
-#include "deparse.h"
 
-
-/*
- * Global context for foreign_expr_walker's search of an expression tree.
- */
-typedef struct foreign_glob_cxt
-{
-	PlannerInfo *root;			/* global planner state */
-	RelOptInfo *foreignrel;		/* the foreign relation we are planning for */
-	Relids		relids;			/* relids of base relations in the underlying
-								 * scan */
-} foreign_glob_cxt;
-
-/*
- * Local (per-tree-level) context for foreign_expr_walker's search.
- * This is concerned with identifying collations used in the expression.
- */
-typedef enum
-{
-	FDW_COLLATE_NONE,			/* expression is of a noncollatable type, or
-								 * it has default collation that is not
-								 * traceable to a foreign Var */
-	FDW_COLLATE_SAFE,			/* collation derives from a foreign Var */
-	FDW_COLLATE_UNSAFE			/* collation is non-default and derives from
-								 * something other than a foreign Var */
-} FDWCollateState;
-
-typedef struct foreign_loc_cxt
-{
-	Oid			collation;		/* OID of current collation, if any */
-	FDWCollateState state;		/* state of current collation choice */
-} foreign_loc_cxt;
 
 /*
  * Context for deparseExpr
@@ -120,9 +88,6 @@ typedef struct deparse_expr_cxt
  * Functions to determine whether an expression can be evaluated safely on
  * remote server.
  */
-static bool foreign_expr_walker(Node *node,
-					foreign_glob_cxt *glob_cxt,
-					foreign_loc_cxt *outer_cxt);
 static char *deparse_type_name(Oid type_oid, int32 typemod);
 
 /*
@@ -194,88 +159,6 @@ static void get_relation_column_alias_ids(Var *node, RelOptInfo *foreignrel,
 										  int *relno, int *colno);
 
 
-/*
- * Examine each qual clause in input_conds, and classify them into two groups,
- * which are returned as two lists:
- *	- remote_conds contains expressions that can be evaluated remotely
- *	- local_conds contains expressions that can't be evaluated remotely
- */
-void
-classifyConditions(PlannerInfo *root,
-				   RelOptInfo *baserel,
-				   List *input_conds,
-				   List **remote_conds,
-				   List **local_conds)
-{
-	ListCell   *lc;
-
-	*remote_conds = NIL;
-	*local_conds = NIL;
-
-	foreach(lc, input_conds)
-	{
-		RestrictInfo *ri = lfirst_node(RestrictInfo, lc);
-
-		if (is_foreign_expr(root, baserel, ri->clause))
-			*remote_conds = lappend(*remote_conds, ri);
-		else
-			*local_conds = lappend(*local_conds, ri);
-	}
-}
-
-/*
- * Returns true if given expr is safe to evaluate on the foreign server.
- */
-bool
-is_foreign_expr(PlannerInfo *root,
-				RelOptInfo *baserel,
-				Expr *expr)
-{
-	foreign_glob_cxt glob_cxt;
-	foreign_loc_cxt loc_cxt;
-	SqliteFdwRelationInfo *fpinfo = (SqliteFdwRelationInfo *) (baserel->fdw_private);
-
-	/*
-	 * Check that the expression consists of nodes that are safe to execute
-	 * remotely.
-	 */
-	glob_cxt.root = root;
-	glob_cxt.foreignrel = baserel;
-
-	/*
-	 * For an upper relation, use relids from its underneath scan relation,
-	 * because the upperrel's own relids currently aren't set to anything
-	 * meaningful by the core code.  For other relation, use their own relids.
-	 */
-	if (IS_UPPER_REL(baserel))
-		glob_cxt.relids = fpinfo->grouped_rel->relids;
-	else
-		glob_cxt.relids = baserel->relids;
-	loc_cxt.collation = InvalidOid;
-	loc_cxt.state = FDW_COLLATE_NONE;
-	if (!foreign_expr_walker((Node *) expr, &glob_cxt, &loc_cxt))
-		return false;
-
-	/*
-	 * If the expression has a valid collation that does not arise from a
-	 * foreign var, the expression can not be sent over.
-	 */
-	if (loc_cxt.state == FDW_COLLATE_UNSAFE)
-		return false;
-
-	/*
-	 * An expression which includes any mutable functions can't be sent over
-	 * because its result is not stable.  For example, sending now() remote
-	 * side could cause confusion from clock offsets.  Future versions might
-	 * be able to make this choice with more granularity.  (We check this last
-	 * because it requires a lot of expensive catalog lookups.)
-	 */
-	if (contain_mutable_functions((Node *) expr))
-		return false;
-
-	/* OK to evaluate on the remote server */
-	return true;
-}
 
 /*
  * Check if expression is safe to execute remotely, and return true if so.
@@ -290,7 +173,7 @@ is_foreign_expr(PlannerInfo *root,
  * that the given expression is valid.  Note function mutability is not
  * currently considered here.
  */
-static bool
+bool
 foreign_expr_walker(Node *node,
 					foreign_glob_cxt *glob_cxt,
 					foreign_loc_cxt *outer_cxt)

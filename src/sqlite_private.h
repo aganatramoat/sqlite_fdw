@@ -1,5 +1,21 @@
 #ifndef SQLITE_FDW_PRIVATE_H
 #define SQLITE_FDW_PRIVATE_H
+#pragma GCC visibility push(hidden)
+
+#define SQLITE_FDW_LOG_LEVEL WARNING
+
+typedef struct 
+{
+    bool import_notnull;
+    bool import_default;
+} SqliteTableImportOptions;
+
+
+typedef struct 
+{
+    char   *database;
+    char   *table;
+} SqliteTableSource;
 
 
 typedef struct 
@@ -21,7 +37,7 @@ typedef struct
     /* Other costs */
     Cost  fdw_startup_cost;
     Cost  fdw_tuple_cost;
-} SqliteRelationCosts;
+} SqliteRelationCostSize;
 
 
 typedef struct 
@@ -70,9 +86,9 @@ typedef struct
 	Bitmapset  *attrs_used;
     bool       pushdown_safe;
 
-    SqliteRelationCosts costs;
-    SqliteJoinSpec      joinspec;
-    SqliteSubquerySpec  subqspec;
+    SqliteRelationCostSize costsize;
+    SqliteJoinSpec         joinspec;
+    SqliteSubquerySpec     subqspec;
 	
     /* Grouping information */
 	List	   *grouped_tlist;
@@ -94,6 +110,7 @@ typedef struct
     int relation_index;
 } SqliteFdwRelationInfo;
 
+
 /* Callback argument for ec_member_matches_foreign */
 typedef struct
 {
@@ -101,9 +118,54 @@ typedef struct
 	List	   *already_used;	/* expressions already dealt with */
 } ec_member_foreign_arg;
 
+
+typedef struct SqliteFdwExecutionState
+{
+	struct sqlite3 *db;
+	struct sqlite3_stmt  *stmt;
+	char          *query;
+	List          *retrieved_attrs;   /* list of target attribute numbers */
+} SqliteFdwExecutionState;
+
+
+/*
+ * Global context for foreign_expr_walker's search of an expression tree.
+ */
+typedef struct foreign_glob_cxt
+{
+	PlannerInfo *root;			/* global planner state */
+	RelOptInfo *foreignrel;		/* the foreign relation we are planning for */
+	Relids		relids;			/* relids of base relations in the underlying
+								 * scan */
+} foreign_glob_cxt;
+
+
+/*
+ * Local (per-tree-level) context for foreign_expr_walker's search.
+ * This is concerned with identifying collations used in the expression.
+ */
+typedef enum
+{
+	FDW_COLLATE_NONE,			/* expression is of a noncollatable type, or
+								 * it has default collation that is not
+								 * traceable to a foreign Var */
+	FDW_COLLATE_SAFE,			/* collation derives from a foreign Var */
+	FDW_COLLATE_UNSAFE			/* collation is non-default and derives from
+								 * something other than a foreign Var */
+} FDWCollateState;
+
+
+typedef struct foreign_loc_cxt
+{
+	Oid			collation;		/* OID of current collation, if any */
+	FDWCollateState state;		/* state of current collation choice */
+} foreign_loc_cxt;
+
+
 // from shippable.c
 bool is_builtin(Oid objectId);
 bool is_shippable(Oid objectId, Oid classId, SqliteFdwRelationInfo *fpinfo);
+
 
 // from deparse.c
 List * build_tlist_to_deparse(RelOptInfo *foreignrel);
@@ -137,10 +199,52 @@ void deparseDirectDeleteSql(StringInfo buf, PlannerInfo *root,
 void deparseAnalyzeSizeSql(StringInfo buf, Relation rel);
 void deparseStringLiteral(StringInfo buf, const char *val);
 void deparseAnalyzeSql(StringInfo buf, Relation rel, List **retrieved_attrs);
+void deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
+						List *tlist, List *remote_conds, List *pathkeys,
+						bool is_subquery, List **retrieved_attrs,
+						List **params_list);
+bool foreign_expr_walker(Node *node, foreign_glob_cxt *glob_cxt,
+					     foreign_loc_cxt *outer_cxt);
 
 // from sqlite_fdw.c
 int set_transmission_modes(void);
 void reset_transmission_modes(int nestlevel);
 Expr * find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel);
+void add_pathsWithPathKeysForRel(PlannerInfo *root, RelOptInfo *rel,
+                                     Path *epq_path);
+bool ec_member_matches_foreign(PlannerInfo *root, RelOptInfo *rel,
+						       EquivalenceClass *ec, EquivalenceMember *em,
+						       void *arg);
+void estimate_path_cost_size(PlannerInfo *root, RelOptInfo *baserel,
+						     List *join_conds, List *pathkeys,
+                             SqliteRelationCostSize *costs);
+void sqlite_bind_param_values(SqliteFdwExecutionState *festate,
+                              List *fdw_exprs, 
+                              ForeignScanState * node);
+void cleanup_(SqliteFdwExecutionState *);
 
+// from funcs.c
+SqliteTableSource get_tableSource(Oid foreigntableid);
+struct sqlite3_stmt * prepare_sqliteQuery(struct sqlite3 *db, char *query, 
+                                          const char **pzTail);
+bool foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
+				RelOptInfo *outerrel, RelOptInfo *innerrel,
+				JoinPathExtraData *extra);
+bool is_foreign_expr(PlannerInfo *root, RelOptInfo *baserel, Expr *expr);
+void classifyConditions(PlannerInfo *root, RelOptInfo *baserel,
+				        List *input_conds,
+				        List **remote_conds, List **local_conds);
+Datum make_datum(struct sqlite3_stmt *stmt, int col, Oid pgtyp, bool *isnull);
+struct sqlite3 * get_sqliteDbHandle(char const *filename);
+bool is_sqliteTableRequired(ImportForeignSchemaStmt *stmt, 
+                            char const * tablename);
+char *get_foreignTableCreationSql(ImportForeignSchemaStmt *stmt, 
+                                  struct sqlite3 *db,
+                                  char const * tablename,
+                                  SqliteTableImportOptions options);
+SqliteTableImportOptions get_sqliteTableImportOptions(
+        ImportForeignSchemaStmt *stmt);
+
+
+#pragma GCC visibility pop
 #endif

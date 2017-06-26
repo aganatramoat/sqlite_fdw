@@ -1,7 +1,9 @@
 #include <postgres.h>
+#include <miscadmin.h>
 #include <nodes/parsenodes.h>
 #include <nodes/relation.h>
 #include <nodes/execnodes.h>
+#include <nodes/nodeFuncs.h>
 #include <lib/stringinfo.h>
 #include <utils/builtins.h>
 #include <utils/formatting.h>
@@ -9,10 +11,17 @@
 #include <commands/defrem.h>
 #include <utils/lsyscache.h>
 #include <utils/syscache.h>
+#include <utils/selfuncs.h>
+#include <utils/guc.h>
 #include <catalog/pg_type.h>
 #include <access/htup_details.h>
 #include <optimizer/clauses.h>
+#include <optimizer/cost.h>
+#include <optimizer/tlist.h>
+#include <optimizer/pathnode.h>
+#include <executor/executor.h>
 
+#include <sys/stat.h>
 #include <sqlite3.h>
 
 #include "sqlite_private.h"
@@ -163,8 +172,8 @@ prepare_sqliteQuery(sqlite3 *db, char *query, const char **pzTail)
 {
     sqlite3_stmt *stmt;
     
-    // elog(SQLITE_FDW_LOG_LEVEL, 
-         // "entering function prepare_sqliteQuery with \n%s", query);
+    elog(SQLITE_FDW_LOG_LEVEL, 
+         "entering function prepare_sqliteQuery with \n%s", query);
 
 	/* Execute the query */
 	if ( sqlite3_prepare_v2(db, query, -1, &stmt, pzTail) != 
@@ -527,7 +536,7 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 	 * know which quals can be evaluated on the foreign server, which might
 	 * depend on shippable_extensions.
 	 */
-	// fpinfo->server = fpinfo_o->server;
+	fpinfo->src.database = fpinfo_o->src.database;
 	// merge_fdw_options(fpinfo, fpinfo_o, fpinfo_i);
 
 	/*
@@ -867,4 +876,576 @@ sqlite_bind_param_value(SqliteFdwExecutionState *festate,
                         sqlite3_errmsg(festate->db))
             ));
     }
+}
+
+    
+static void
+estimate_join_rel_cost(PlannerInfo *root,
+					   RelOptInfo *foreignrel,
+                       SqliteCostEstimates * est)
+{
+	SqliteFdwRelationInfo *fpinfo = (SqliteFdwRelationInfo *) 
+                                    foreignrel->fdw_private;
+    SqliteFdwRelationInfo *fpinfo_i;
+    SqliteFdwRelationInfo *fpinfo_o;
+    QualCost	join_cost;
+    QualCost	remote_conds_cost;
+    double		nrows;
+
+    /* For join we expect inner and outer relations set */
+    Assert(fpinfo->joinspec.innerrel && fpinfo->joinspec.outerrel);
+
+    fpinfo_i = (SqliteFdwRelationInfo *) fpinfo->joinspec.innerrel->fdw_private;
+    fpinfo_o = (SqliteFdwRelationInfo *) fpinfo->joinspec.outerrel->fdw_private;
+
+    /* Estimate of number of rows in cross product */
+    nrows = fpinfo_i->costsize.rows * fpinfo_o->costsize.rows;
+    /* Clamp retrieved rows estimate to at most size of cross product */
+    est->retrieved_rows = Min(est->retrieved_rows, nrows);
+
+    /*
+     * The cost of foreign join is estimated as cost of generating
+     * rows for the joining relations + cost for applying quals on the
+     * rows.
+     */
+
+    /*
+     * Calculate the cost of clauses pushed down to the foreign server
+     */
+    cost_qual_eval(&remote_conds_cost, fpinfo->remote_conds, root);
+    /* Calculate the cost of applying join clauses */
+    cost_qual_eval(&join_cost, fpinfo->joinspec.clauses, root);
+
+    /*
+     * Startup cost includes startup cost of joining relations and the
+     * startup cost for join and other clauses. We do not include the
+     * startup cost specific to join strategy (e.g. setting up hash
+     * tables) since we do not know what strategy the foreign server
+     * is going to use.
+     */
+    est->startup_cost = fpinfo_i->costsize.rel_startup_cost + 
+                        fpinfo_o->costsize.rel_startup_cost;
+    est->startup_cost += join_cost.startup;
+    est->startup_cost += remote_conds_cost.startup;
+    est->startup_cost += fpinfo->costsize.local_conds_cost.startup;
+
+    /*
+     * Run time cost includes:
+     *
+     * 1. Run time cost (total_cost - startup_cost) of relations being
+     * joined
+     *
+     * 2. Run time cost of applying join clauses on the cross product
+     * of the joining relations.
+     *
+     * 3. Run time cost of applying pushed down other clauses on the
+     * result of join
+     *
+     * 4. Run time cost of applying nonpushable other clauses locally
+     * on the result fetched from the foreign server.
+     */
+    est->run_cost = fpinfo_i->costsize.rel_total_cost - 
+                    fpinfo_i->costsize.rel_startup_cost;
+    est->run_cost += fpinfo_o->costsize.rel_total_cost - 
+                     fpinfo_o->costsize.rel_startup_cost;
+    est->run_cost += nrows * join_cost.per_tuple;
+    nrows = clamp_row_est(nrows * fpinfo->joinspec.clause_sel);
+    est->run_cost += nrows * remote_conds_cost.per_tuple;
+    est->run_cost += fpinfo->costsize.local_conds_cost.per_tuple * 
+                     est->retrieved_rows;
+}
+
+    
+static void
+estimate_upper_rel_cost(PlannerInfo *root,
+					    RelOptInfo *foreignrel,
+                        SqliteCostEstimates * est)
+{
+	SqliteFdwRelationInfo *fpinfo = (SqliteFdwRelationInfo *) 
+                                    foreignrel->fdw_private;
+    SqliteFdwRelationInfo *ofpinfo;
+    PathTarget *ptarget = root->upper_targets[UPPERREL_GROUP_AGG];
+    AggClauseCosts aggcosts;
+    double		input_rows;
+    int			numGroupCols;
+    double		numGroups = 1;
+
+    /*
+     * This cost model is mixture of costing done for sorted and
+     * hashed aggregates in cost_agg().  We are not sure which
+     * strategy will be considered at remote side, thus for
+     * simplicity, we put all startup related costs in startup_cost
+     * and all finalization and run cost are added in total_cost.
+     *
+     * Also, core does not care about costing HAVING expressions and
+     * adding that to the costs.  So similarly, here too we are not
+     * considering remote and local conditions for costing.
+     */
+
+    ofpinfo = (SqliteFdwRelationInfo *) fpinfo->grouped_rel->fdw_private;
+
+    /* Get rows and width from input rel */
+    input_rows = ofpinfo->costsize.rows;
+    // width = ofpinfo->cost.width;
+
+    /* Collect statistics about aggregates for estimating costs. */
+    MemSet(&aggcosts, 0, sizeof(AggClauseCosts));
+    if (root->parse->hasAggs)
+    {
+        get_agg_clause_costs(root, (Node *) fpinfo->grouped_tlist,
+                             AGGSPLIT_SIMPLE, &aggcosts);
+        get_agg_clause_costs(root, (Node *) root->parse->havingQual,
+                             AGGSPLIT_SIMPLE, &aggcosts);
+    }
+
+    /* Get number of grouping columns and possible number of groups */
+    numGroupCols = list_length(root->parse->groupClause);
+    numGroups = estimate_num_groups(root,
+                    get_sortgrouplist_exprs(root->parse->groupClause,
+                                            fpinfo->grouped_tlist),
+                                    input_rows, NULL);
+
+    /*
+     * Number of rows expected from foreign server will be same as
+     * that of number of groups.
+     */
+    est->rows = est->retrieved_rows = numGroups;
+
+    /*-----
+     * Startup cost includes:
+     *	  1. Startup cost for underneath input * relation
+     *	  2. Cost of performing aggregation, per cost_agg()
+     *	  3. Startup cost for PathTarget eval
+     *-----
+     */
+    est->startup_cost = ofpinfo->costsize.rel_startup_cost;
+    est->startup_cost += aggcosts.transCost.startup;
+    est->startup_cost += aggcosts.transCost.per_tuple * input_rows;
+    est->startup_cost += (cpu_operator_cost * numGroupCols) * input_rows;
+    est->startup_cost += ptarget->cost.startup;
+
+    /*-----
+     * Run time cost includes:
+     *	  1. Run time cost of underneath input relation
+     *	  2. Run time cost of performing aggregation, per cost_agg()
+     *	  3. PathTarget eval cost for each output row
+     *-----
+     */
+    est->run_cost = ofpinfo->costsize.rel_total_cost - 
+                    ofpinfo->costsize.rel_startup_cost;
+    est->run_cost += aggcosts.finalCost * numGroups;
+    est->run_cost += cpu_tuple_cost * numGroups;
+    est->run_cost += ptarget->cost.per_tuple * numGroups;
+
+    // TODO AG remove these lines
+    est->startup_cost = 0.0;
+    est->run_cost = 0.5;
+}
+
+    
+static void
+estimate_base_rel_cost(PlannerInfo *root,
+					    RelOptInfo *foreignrel,
+                        SqliteCostEstimates * est)
+{
+	Cost	cpu_per_tuple = cpu_tuple_cost + 
+                            foreignrel->baserestrictcost.per_tuple;
+    
+    /* Clamp retrieved rows estimates to at most foreignrel->tuples. */
+    est->retrieved_rows = Min(est->retrieved_rows, foreignrel->tuples);
+
+    /*
+     * Cost as though this were a seqscan, which is pessimistic.  We
+     * effectively imagine the local_conds are being evaluated
+     * remotely, too.
+     */
+    est->startup_cost = 0;
+    est->run_cost = 0;
+    est->run_cost += seq_page_cost * foreignrel->pages;
+
+    est->startup_cost += foreignrel->baserestrictcost.startup;
+    est->run_cost += cpu_per_tuple * foreignrel->tuples;
+}
+
+
+/*
+ * estimate_path_cost_size
+ *		Get cost and size estimates for a foreign scan on given foreign relation
+ *		either a base relation or a join between foreign relations or an upper
+ *		relation containing foreign relations.
+ *
+ * param_join_conds are the parameterization clauses with outer relations.
+ * pathkeys specify the expected sort order if any for given path being costed.
+ *
+ * The function returns the cost and size estimates in p_row, p_width,
+ * p_startup_cost and p_total_cost variables.
+ */
+void
+estimate_path_cost_size(PlannerInfo *root,
+						RelOptInfo *foreignrel,
+						List *param_join_conds,
+						List *pathkeys,
+                        SqliteRelationCostSize * store)
+{
+	SqliteFdwRelationInfo *fpinfo = (SqliteFdwRelationInfo *) 
+                                     foreignrel->fdw_private;
+    SqliteCostEstimates est = {0};
+
+    /*
+     * We don't support join conditions in this mode (hence, no
+     * parameterized paths can be made).
+     */
+    Assert(param_join_conds == NIL);
+
+    /*
+     * Use rows/width estimates made by set_baserel_size_estimates() for
+     * base foreign relations and set_joinrel_size_estimates() for join
+     * between foreign relations.
+     */
+    est.rows = foreignrel->rows;
+    est.width = foreignrel->reltarget->width;
+
+    /* Back into an estimate of the number of retrieved rows. */
+    est.retrieved_rows = clamp_row_est(est.rows / 
+                                       fpinfo->costsize.local_conds_sel);
+
+    /*
+     * We will come here again and again with different set of pathkeys
+     * that caller wants to cost. We don't need to calculate the cost of
+     * bare scan each time. Instead, use the costs if we have cached them
+     * already.
+     */
+    if (fpinfo->costsize.rel_startup_cost > 0 && 
+        fpinfo->costsize.rel_total_cost > 0)
+    {
+        est.startup_cost = fpinfo->costsize.rel_startup_cost;
+        est.run_cost = fpinfo->costsize.rel_total_cost - est.startup_cost;
+    }
+    else if (IS_JOIN_REL(foreignrel))
+    {
+        estimate_join_rel_cost(root, foreignrel, &est);
+    }
+    else if (IS_UPPER_REL(foreignrel))
+    {
+        elog(SQLITE_FDW_LOG_LEVEL, "DEBUG: Estimating upperrel cost");
+        estimate_upper_rel_cost(root, foreignrel, &est);
+    }
+    else
+    {
+        estimate_base_rel_cost(root, foreignrel, &est);
+    }
+
+    /*
+     * Without remote estimates, we have no real way to estimate the cost
+     * of generating sorted output.  It could be free if the query plan
+     * the remote side would have chosen generates properly-sorted output
+     * anyway, but in most cases it will cost something.  Estimate a value
+     * high enough that we won't pick the sorted path when the ordering
+     * isn't locally useful, but low enough that we'll err on the side of
+     * pushing down the ORDER BY clause when it's useful to do so.
+     */
+    if (pathkeys != NIL)
+    {
+        est.startup_cost *= DEFAULT_FDW_SORT_MULTIPLIER;
+        est.run_cost *= DEFAULT_FDW_SORT_MULTIPLIER;
+    }
+
+	/*
+	 * Cache the costs for scans without any pathkeys or parameterization
+	 * before adding the costs for transferring data from the foreign server.
+	 * These costs are useful for costing the join between this relation and
+	 * another foreign relation or to calculate the costs of paths with
+	 * pathkeys for this relation, when the costs can not be obtained from the
+	 * foreign server. This function will be called at least once for every
+	 * foreign relation without pathkeys and parameterization.
+	 */
+	if (pathkeys == NIL && param_join_conds == NIL)
+	{
+		fpinfo->costsize.rel_startup_cost = est.startup_cost;
+		fpinfo->costsize.rel_total_cost = est.startup_cost + est.run_cost;
+	}
+	
+    // Connection overhead
+    est.startup_cost += fpinfo->costsize.fdw_startup_cost;
+
+	/* Return results.
+     * Add all costs and account for network transfer and local manipulation
+     * of the rows
+	 * (fdw_tuple_cost per retrieved row), and local manipulation of the data
+	 * (cpu_tuple_cost per retrieved row).
+	*/
+    store->rows = est.rows;
+    store->width = est.width;
+    store->startup_cost = est.startup_cost;
+    store->total_cost = est.startup_cost + est.run_cost + 
+                        (fpinfo->costsize.fdw_tuple_cost + cpu_tuple_cost) *
+                        est.retrieved_rows;
+}
+
+    
+bool
+file_exists(const char *name)
+{
+	struct stat st;
+
+	AssertArg(name != NULL);
+
+	if (stat(name, &st) == 0)
+		return S_ISDIR(st.st_mode) ? false : true;
+	else if (!(errno == ENOENT || errno == ENOTDIR || errno == EACCES))
+		ereport(ERROR,
+                (errcode_for_file_access(),
+				 errmsg("could not access file \"%s\": %m", name)));
+
+	return false;
+}
+
+
+
+void
+sqlite_bind_param_values(SqliteFdwExecutionState *festate, List *fdw_exprs, 
+                         ForeignScanState *node)
+{
+	ListCell   *lc;
+    Oid  *param_types;
+	List *param_exprs;
+    int i;
+    MemoryContext oldcontext;
+
+    param_exprs = (List *) ExecInitExpr((Expr *) fdw_exprs, (PlanState *)node);
+    param_types = (Oid *) palloc0(sizeof(Oid) * list_length(fdw_exprs));
+    
+    i = 0;
+    foreach(lc, fdw_exprs)
+		param_types[i++] = exprType((Node *) lfirst(lc));
+
+    oldcontext = MemoryContextSwitchTo(
+                    node->ss.ps.ps_ExprContext->ecxt_per_tuple_memory);
+
+    i = 0;
+    foreach(lc, param_exprs)
+	{
+		ExprState  *expr_state = (ExprState *) lfirst(lc);
+		Datum		expr_value;
+		bool		isNull;
+
+		/* Evaluate the parameter expression */
+		expr_value = ExecEvalExpr(expr_state, node->ss.ps.ps_ExprContext, &isNull);
+        sqlite_bind_param_value(festate, i+1, param_types[i], expr_value, isNull);
+        i++;
+    }
+    oldcontext = MemoryContextSwitchTo(oldcontext);
+}
+
+
+void
+cleanup_(SqliteFdwExecutionState *festate)
+{
+    if ( festate->stmt ) {
+        sqlite3_finalize(festate->stmt);
+        festate->stmt = NULL;
+    }
+    if ( festate->db ) {
+        sqlite3_close(festate->db);
+        festate->db = NULL;
+    }
+}
+
+
+void
+add_pathsWithPathKeysForRel(PlannerInfo *root, RelOptInfo *rel,
+								Path *epq_path)
+{
+	List	   *useful_pathkeys_list = NIL;		/* List of all pathkeys */
+	ListCell   *lc;
+
+	useful_pathkeys_list = get_useful_pathkeys_for_relation(root, rel);
+
+	/* Create one path for each set of pathkeys we found above. */
+	foreach(lc, useful_pathkeys_list)
+	{
+		List	   *useful_pathkeys = lfirst(lc);
+        SqliteRelationCostSize costs;
+		estimate_path_cost_size(root, rel, NIL, useful_pathkeys, &costs);
+		add_path(rel, (Path *)
+				 create_foreignscan_path(root, rel,
+										 NULL,
+										 costs.rows,
+										 costs.startup_cost,
+										 costs.total_cost,
+										 useful_pathkeys,
+										 NULL,
+										 epq_path,
+										 NIL));
+	}
+}
+
+
+
+/*
+ * get_useful_pathkeys_for_relation
+ *		Determine which orderings of a relation might be useful.
+ *
+ * Getting data in sorted order can be useful either because the requested
+ * order matches the final output ordering for the overall query we're
+ * planning, or because it enables an efficient merge join.  Here, we try
+ * to figure out which pathkeys to consider.
+ */
+List *
+get_useful_pathkeys_for_relation(PlannerInfo *root, RelOptInfo *rel)
+{
+	List	   *useful_pathkeys_list = NIL;
+	ListCell   *lc;
+
+	/*
+	 * Pushing the query_pathkeys to the remote server is always worth
+	 * considering, because it might let us avoid a local sort.
+	 */
+	if (root->query_pathkeys)
+	{
+		bool		query_pathkeys_ok = true;
+
+		foreach(lc, root->query_pathkeys)
+		{
+			PathKey    *pathkey = (PathKey *) lfirst(lc);
+			EquivalenceClass *pathkey_ec = pathkey->pk_eclass;
+			Expr	   *em_expr;
+
+			/*
+			 * The planner and executor don't have any clever strategy for
+			 * taking data sorted by a prefix of the query's pathkeys and
+			 * getting it to be sorted by all of those pathkeys. We'll just
+			 * end up resorting the entire data set.  So, unless we can push
+			 * down all of the query pathkeys, forget it.
+			 *
+			 * is_foreign_expr would detect volatile expressions as well, but
+			 * checking ec_has_volatile here saves some cycles.
+			 */
+			if (pathkey_ec->ec_has_volatile ||
+				!(em_expr = find_em_expr_for_rel(pathkey_ec, rel)) ||
+				!is_foreign_expr(root, rel, em_expr))
+			{
+				query_pathkeys_ok = false;
+				break;
+			}
+		}
+
+		if (query_pathkeys_ok)
+			useful_pathkeys_list = list_make1(list_copy(root->query_pathkeys));
+	}
+
+    return useful_pathkeys_list;
+}
+
+
+
+/*
+ * Detect whether we want to process an EquivalenceClass member.
+ *
+ * This is a callback for use by generate_implied_equalities_for_column.
+ */
+bool
+ec_member_matches_foreign(PlannerInfo *root, RelOptInfo *rel,
+						  EquivalenceClass *ec, EquivalenceMember *em,
+						  void *arg)
+{
+	ec_member_foreign_arg *state = (ec_member_foreign_arg *) arg;
+	Expr	   *expr = em->em_expr;
+
+	/*
+	 * If we've identified what we're processing in the current scan, we only
+	 * want to match that expression.
+	 */
+	if (state->current != NULL)
+		return equal(expr, state->current);
+
+	/*
+	 * Otherwise, ignore anything we've already processed.
+	 */
+	if (list_member(state->already_used, expr))
+		return false;
+
+	/* This is the new target to process. */
+	state->current = expr;
+	return true;
+}
+
+
+/*
+ * Force assorted GUC parameters to settings that ensure that we'll output
+ * data values in a form that is unambiguous to the remote server.
+ *
+ * This is rather expensive and annoying to do once per row, but there's
+ * little choice if we want to be sure values are transmitted accurately;
+ * we can't leave the settings in place between rows for fear of affecting
+ * user-visible computations.
+ *
+ * We use the equivalent of a function SET option to allow the settings to
+ * persist only until the caller calls reset_transmission_modes().  If an
+ * error is thrown in between, guc.c will take care of undoing the settings.
+ *
+ * The return value is the nestlevel that must be passed to
+ * reset_transmission_modes() to undo things.
+ */
+int
+set_transmission_modes(void)
+{
+	int			nestlevel = NewGUCNestLevel();
+
+	/*
+	 * The values set here should match what pg_dump does.  See also
+	 * configure_remote_session in connection.c.
+	 */
+	if (DateStyle != USE_ISO_DATES)
+		(void) set_config_option("datestyle", "ISO",
+								 PGC_USERSET, PGC_S_SESSION,
+								 GUC_ACTION_SAVE, true, 0, false);
+	if (IntervalStyle != INTSTYLE_POSTGRES)
+		(void) set_config_option("intervalstyle", "postgres",
+								 PGC_USERSET, PGC_S_SESSION,
+								 GUC_ACTION_SAVE, true, 0, false);
+	if (extra_float_digits < 3)
+		(void) set_config_option("extra_float_digits", "3",
+								 PGC_USERSET, PGC_S_SESSION,
+								 GUC_ACTION_SAVE, true, 0, false);
+
+	return nestlevel;
+}
+
+/*
+ * Undo the effects of set_transmission_modes().
+ */
+void
+reset_transmission_modes(int nestlevel)
+{
+	AtEOXact_GUC(true, nestlevel);
+}
+
+
+/*
+ * Find an equivalence class member expression, all of whose Vars, come from
+ * the indicated relation.
+ */
+extern Expr *
+find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel)
+{
+	ListCell   *lc_em;
+
+	foreach(lc_em, ec->ec_members)
+	{
+		EquivalenceMember *em = lfirst(lc_em);
+
+		if (bms_is_subset(em->em_relids, rel->relids))
+		{
+			/*
+			 * If there is more than one equivalence member whose Vars are
+			 * taken entirely from this relation, we'll be content to choose
+			 * any one of those.
+			 */
+			return em->em_expr;
+		}
+	}
+
+	/* We didn't find any suitable equivalence class expression */
+	return NULL;
 }

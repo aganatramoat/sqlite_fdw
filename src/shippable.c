@@ -29,9 +29,9 @@
 #include "utils/inval.h"
 #include "utils/syscache.h"
 #include "nodes/relation.h"
+#include "nodes/execnodes.h"
 
 
-#include "sqlite_fdw.h"
 #include "sqlite_private.h"
 
 

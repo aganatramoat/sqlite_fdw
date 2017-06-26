@@ -1,8 +1,10 @@
 #ifndef SQLITE_FDW_PRIVATE_H
 #define SQLITE_FDW_PRIVATE_H
-#pragma GCC visibility push(hidden)
+// #pragma GCC visibility push(hidden)
 
 #define SQLITE_FDW_LOG_LEVEL WARNING
+#define DEFAULT_FDW_SORT_MULTIPLIER 1.2
+#define DEFAULT_FDW_STARTUP_COST 100.0
 
 typedef struct 
 {
@@ -206,15 +208,10 @@ void deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
 bool foreign_expr_walker(Node *node, foreign_glob_cxt *glob_cxt,
 					     foreign_loc_cxt *outer_cxt);
 
-// from sqlite_fdw.c
-int set_transmission_modes(void);
-void reset_transmission_modes(int nestlevel);
-Expr * find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel);
+
+// from funcs.c
 void add_pathsWithPathKeysForRel(PlannerInfo *root, RelOptInfo *rel,
                                      Path *epq_path);
-bool ec_member_matches_foreign(PlannerInfo *root, RelOptInfo *rel,
-						       EquivalenceClass *ec, EquivalenceMember *em,
-						       void *arg);
 void estimate_path_cost_size(PlannerInfo *root, RelOptInfo *baserel,
 						     List *join_conds, List *pathkeys,
                              SqliteRelationCostSize *costs);
@@ -222,8 +219,6 @@ void sqlite_bind_param_values(SqliteFdwExecutionState *festate,
                               List *fdw_exprs, 
                               ForeignScanState * node);
 void cleanup_(SqliteFdwExecutionState *);
-
-// from funcs.c
 SqliteTableSource get_tableSource(Oid foreigntableid);
 struct sqlite3_stmt * prepare_sqliteQuery(struct sqlite3 *db, char *query, 
                                           const char **pzTail);
@@ -246,7 +241,26 @@ SqliteTableImportOptions get_sqliteTableImportOptions(
         ImportForeignSchemaStmt *stmt);
 void sqlite_bind_param_value(SqliteFdwExecutionState *festate,
                         int index, Oid ptype, Datum pval, bool isNull);
+void estimate_path_cost_size(PlannerInfo *root,
+						RelOptInfo *foreignrel,
+						List *param_join_conds,
+						List *pathkeys,
+                        SqliteRelationCostSize * store);
+bool file_exists(const char *name);
+void sqlite_bind_param_values(SqliteFdwExecutionState *festate, 
+                              List *fdw_exprs, 
+                              ForeignScanState *node);
+void cleanup_(SqliteFdwExecutionState *festate);
+void add_pathsWithPathKeysForRel(PlannerInfo *root, RelOptInfo *rel,
+								 Path *epq_path);
+List * get_useful_pathkeys_for_relation(PlannerInfo *root, RelOptInfo *rel);
+bool ec_member_matches_foreign(PlannerInfo *root, RelOptInfo *rel,
+						       EquivalenceClass *ec, EquivalenceMember *em,
+						       void *arg);
+int set_transmission_modes(void);
+Expr * find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel);
+void reset_transmission_modes(int nestlevel);
 
 
-#pragma GCC visibility pop
+// #pragma GCC visibility pop
 #endif

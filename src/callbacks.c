@@ -215,9 +215,6 @@ get_foreignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid)
 	SqliteFdwRelationInfo *fpinfo;
 	ListCell              *lc;
     
-    //elog(SQLITE_FDW_LOG_LEVEL, 
-         // "entering function sqliteGetForeignRelSize");
-
     // initialize the fields of baserel that we will set
 	baserel->rows = 0;
 	fpinfo = palloc0(sizeof(SqliteFdwRelationInfo));
@@ -230,15 +227,8 @@ get_foreignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid)
                     &fpinfo->attrs_used);
     
     //  classify the condition as local or remote
-    foreach(lc, baserel->baserestrictinfo)
-	{
-		RestrictInfo *ri = (RestrictInfo *) lfirst(lc);
-
-		if (is_foreign_expr(root, baserel, ri->clause))
-			fpinfo->remote_conds = lappend(fpinfo->remote_conds, ri);
-		else
-			fpinfo->local_conds = lappend(fpinfo->local_conds, ri);
-	}
+    classifyConditions(root, baserel, baserel->baserestrictinfo, 
+                       &fpinfo->remote_conds, &fpinfo->local_conds);
 	
     // fetch the attributes that are needed locally by postgres
 	foreach(lc, fpinfo->local_conds)
@@ -337,7 +327,6 @@ get_foreignPlanSimple__(PlannerInfo *root,
 	List        *local_exprs = NULL;
 	List        *remote_exprs = NULL;
 	List        *params_list = NULL;
-	List        *remote_conds = NIL;
 	StringInfoData sql;
 	List           *retrieved_attrs;
 	ListCell       *lc;
@@ -373,10 +362,7 @@ get_foreignPlanSimple__(PlannerInfo *root,
 
 		if ( list_member_ptr(fpinfo->remote_conds, rinfo) ||
              is_foreign_expr(root, baserel, rinfo->clause) )
-		{
-			remote_conds = lappend(remote_conds, rinfo);
 			remote_exprs = lappend(remote_exprs, rinfo->clause);
-		}
         else
 			local_exprs = lappend(local_exprs, rinfo->clause);
 	}
@@ -399,6 +385,7 @@ get_foreignPlanSimple__(PlannerInfo *root,
 	 * Note that the remote parameter expressions are stored in the fdw_exprs
 	 * field of the finished plan node; we can't keep them in private state
 	 * because then they wouldn't be subject to later planner processing.
+     * params_list is what gets passed for fdw_exprs
 	 */
 	return make_foreignscan(tlist,
 	                        local_exprs,
@@ -560,8 +547,6 @@ get_foreignJoinPaths(PlannerInfo *root, RelOptInfo *joinrel,
 	Path	   *epq_path;		/* Path to create plan to be executed when
 								 * EvalPlanQual gets triggered. */
 	
-    elog(SQLITE_FDW_LOG_LEVEL,"XXXXXXXX startGetForeignJoin");
-
 	/*
 	 * Skip if this join combination has been considered already.
 	 */
@@ -710,6 +695,8 @@ begin_foreignScan(ForeignScanState *node, int eflags)
     PG_TRY();
     {
         festate->stmt = prepare_sqliteQuery(festate->db, festate->query, NULL);
+	    elog(SQLITE_FDW_LOG_LEVEL, "the number of parameters is %d",
+                list_length(fsplan->fdw_exprs));
         if ( list_length(fsplan->fdw_exprs) > 0 )
             sqlite_bind_param_values(festate, fsplan->fdw_exprs, node);
     }
@@ -1175,9 +1162,9 @@ add_foreignUpdateTargets(Query *parsetree,
     
 List *
 plan_foreignModify(PlannerInfo *root,
-						   ModifyTable *plan,
-						   Index resultRelation,
-						   int subplan_index)
+                   ModifyTable *plan,
+                   Index resultRelation,
+                   int subplan_index)
 {
 	/*
 	 * Perform any additional planning actions needed for an insert, update,
@@ -1338,7 +1325,7 @@ foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouping_rel)
 
 	/*
 	 * Classify the pushable and non-pushable having clauses and save them in
-	 * remote_conds and local_conds of the grouped rel's fpinfo.
+	 * remote_conds and local_conds of the grouping rel's fpinfo.
 	 */
 	if (root->hasHavingQual && query->havingQual)
 	{

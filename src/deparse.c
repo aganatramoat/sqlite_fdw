@@ -846,6 +846,7 @@ deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
 
 	/* Construct FROM and WHERE clauses */
 	deparseFromExpr(quals, &context);
+    
 
 	if (IS_UPPER_REL(rel))
 	{
@@ -867,7 +868,7 @@ deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
 	/* Add any necessary FOR UPDATE/SHARE. */
 	/* deparseLockingClause(&context); */
     /*
-     * Sqlite's ACID models implies that updates are serializable see:
+     * Sqlite's ACID model implies that updates are serializable see:
      * https://sqlite.org/lockingv3.html
      * Hence we will have no need for locking clauses
      */
@@ -2003,6 +2004,10 @@ deparseVar(Var *node, deparse_expr_cxt *context)
 						 SUBQUERY_COL_ALIAS_PREFIX, colno);
 		return;
 	}
+    // elog(SQLITE_FDW_LOG_LEVEL, 
+    //         "the number of params_list in deparseFromExpr is %d, nodeTag is %d",
+    //         list_length(*context->params_list),
+    //         nodeTag(node));
 
 	if (bms_is_member(node->varno, relids) && node->varlevelsup == 0)
 		deparseColumnRef(context->buf, node->varno, node->varattno,
@@ -2069,6 +2074,11 @@ deparseConst(Const *node, deparse_expr_cxt *context, int showtype)
 	getTypeOutputInfo(node->consttype,
 					  &typoutput, &typIsVarlena);
 	extval = OidOutputFunctionCall(typoutput, node->constvalue);
+    
+    elog(SQLITE_FDW_LOG_LEVEL, 
+            "the number of params_list in deparseConst is %d, extval is %s",
+            list_length(*context->params_list),
+            extval);
 
 	switch (node->consttype)
 	{

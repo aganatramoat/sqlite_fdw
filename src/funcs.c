@@ -69,7 +69,7 @@ static Datum make_datumViaCString__(sqlite3_stmt *stmt, int col,
  *
  *   When sqlite wants to store a value it looks up the column
  *   affinity and tries to cast the value into the appropriate
- *   storage class. It it fails, then it goes to being a blob.
+ *   storage class. If it fails, then it goes to being a blob.
  *   
  *   Numeric is a union of Real and Integer. There are rules 
  *   about trying to convert input Numeric text to real, then trying
@@ -172,8 +172,8 @@ prepare_sqliteQuery(sqlite3 *db, char *query, const char **pzTail)
 {
     sqlite3_stmt *stmt;
     
-    elog(SQLITE_FDW_LOG_LEVEL, 
-         "entering function prepare_sqliteQuery with \n%s", query);
+    // elog(SQLITE_FDW_LOG_LEVEL, 
+    //      "entering function prepare_sqliteQuery with \n%s", query);
 
 	/* Execute the query */
 	if ( sqlite3_prepare_v2(db, query, -1, &stmt, pzTail) != 
@@ -1234,7 +1234,7 @@ sqlite_bind_param_values(SqliteFdwExecutionState *festate, List *fdw_exprs,
         sqlite_bind_param_value(festate, i+1, param_types[i], expr_value, isNull);
         i++;
     }
-    oldcontext = MemoryContextSwitchTo(oldcontext);
+    MemoryContextSwitchTo(oldcontext);
 }
 
 
@@ -1253,8 +1253,9 @@ cleanup_(SqliteFdwExecutionState *festate)
 
 
 void
-add_pathsWithPathKeysForRel(PlannerInfo *root, RelOptInfo *rel,
-								Path *epq_path)
+add_pathsWithPathKeysForRel(PlannerInfo *root, 
+                            RelOptInfo *rel,
+                            Path *epq_path)
 {
 	List	   *useful_pathkeys_list = NIL;		/* List of all pathkeys */
 	ListCell   *lc;

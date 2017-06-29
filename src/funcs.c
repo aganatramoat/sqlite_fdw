@@ -172,9 +172,6 @@ prepare_sqliteQuery(sqlite3 *db, char *query, const char **pzTail)
 {
     sqlite3_stmt *stmt;
     
-    // elog(SQLITE_FDW_LOG_LEVEL, 
-    //      "entering function prepare_sqliteQuery with \n%s", query);
-
 	/* Execute the query */
 	if ( sqlite3_prepare_v2(db, query, -1, &stmt, pzTail) != 
             SQLITE_OK )
@@ -182,7 +179,8 @@ prepare_sqliteQuery(sqlite3 *db, char *query, const char **pzTail)
 		sqlite3_close(db);
 		ereport(ERROR,
 			(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-			errmsg("SQL error during prepare: %s", sqlite3_errmsg(db))
+			errmsg("SQL error during prepare: %s\n query was: %s", 
+                    sqlite3_errmsg(db), query)
 			));
 	}
     return stmt;
@@ -1127,7 +1125,6 @@ estimate_path_cost_size(PlannerInfo *root,
     }
     else if (IS_UPPER_REL(foreignrel))
     {
-        elog(SQLITE_FDW_LOG_LEVEL, "DEBUG: Estimating upperrel cost");
         estimate_upper_rel_cost(root, foreignrel, &est);
     }
     else

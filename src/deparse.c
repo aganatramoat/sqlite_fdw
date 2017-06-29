@@ -2004,10 +2004,6 @@ deparseVar(Var *node, deparse_expr_cxt *context)
 						 SUBQUERY_COL_ALIAS_PREFIX, colno);
 		return;
 	}
-    // elog(SQLITE_FDW_LOG_LEVEL, 
-    //         "the number of params_list in deparseFromExpr is %d, nodeTag is %d",
-    //         list_length(*context->params_list),
-    //         nodeTag(node));
 
 	if (bms_is_member(node->varno, relids) && node->varlevelsup == 0)
 		deparseColumnRef(context->buf, node->varno, node->varattno,
@@ -2064,10 +2060,6 @@ deparseConst(Const *node, deparse_expr_cxt *context, int showtype)
 	if (node->constisnull)
 	{
 		appendStringInfoString(buf, "NULL");
-		if (showtype >= 0)
-			appendStringInfo(buf, "::%s",
-							 deparse_type_name(node->consttype,
-											   node->consttypmod));
 		return;
 	}
 
@@ -2075,11 +2067,6 @@ deparseConst(Const *node, deparse_expr_cxt *context, int showtype)
 					  &typoutput, &typIsVarlena);
 	extval = OidOutputFunctionCall(typoutput, node->constvalue);
     
-    elog(SQLITE_FDW_LOG_LEVEL, 
-            "the number of params_list in deparseConst is %d, extval is %s",
-            list_length(*context->params_list),
-            extval);
-
 	switch (node->consttype)
 	{
 		case INT2OID:
@@ -2111,11 +2098,11 @@ deparseConst(Const *node, deparse_expr_cxt *context, int showtype)
 		case VARBITOID:
 			appendStringInfo(buf, "B'%s'", extval);
 			break;
-		case BOOLOID:
+		case BOOLOID: // booleans should be ints for sqlite
 			if (strcmp(extval, "t") == 0)
-				appendStringInfoString(buf, "true");
+				appendStringInfoString(buf, "1");
 			else
-				appendStringInfoString(buf, "false");
+				appendStringInfoString(buf, "0");
 			break;
 		default:
 			deparseStringLiteral(buf, extval);
@@ -2148,10 +2135,12 @@ deparseConst(Const *node, deparse_expr_cxt *context, int showtype)
 			needlabel = true;
 			break;
 	}
+    // TODO: AG we don't need this type casting business
 	if (needlabel || showtype > 0)
-		appendStringInfo(buf, "::%s",
-						 deparse_type_name(node->consttype,
-										   node->consttypmod));
+        ;
+		// appendStringInfo(buf, "::%s",
+		// 				 deparse_type_name(node->consttype,
+		// 								   node->consttypmod));
 }
 
 /*
@@ -2712,9 +2701,7 @@ printRemoteParam(int paramindex, Oid paramtype, int32 paramtypmod,
 				 deparse_expr_cxt *context)
 {
 	StringInfo	buf = context->buf;
-	char	   *ptypename = deparse_type_name(paramtype, paramtypmod);
-
-	appendStringInfo(buf, "$%d::%s", paramindex, ptypename);
+	appendStringInfo(buf, "$%d", paramindex);
 }
 
 /*
@@ -2738,9 +2725,7 @@ printRemotePlaceholder(Oid paramtype, int32 paramtypmod,
 					   deparse_expr_cxt *context)
 {
 	StringInfo	buf = context->buf;
-	char	   *ptypename = deparse_type_name(paramtype, paramtypmod);
-
-	appendStringInfo(buf, "((SELECT null::%s)::%s)", ptypename, ptypename);
+	appendStringInfo(buf, "(SELECT null)");
 }
 
 /*
@@ -2805,16 +2790,22 @@ appendOrderByClause(List *pathkeys, deparse_expr_cxt *context)
 		Assert(em_expr != NULL);
 
 		appendStringInfoString(buf, delim);
+        appendStringInfoString(buf, " case ");
+        deparseExpr(em_expr, context);
+        appendStringInfoString(buf, " when null then 0 else 1 end ");
+        appendStringInfoString(buf, pathkey->pk_nulls_first ?
+                                    "ASC, " :
+                                    "DESC, ");
 		deparseExpr(em_expr, context);
 		if (pathkey->pk_strategy == BTLessStrategyNumber)
 			appendStringInfoString(buf, " ASC");
 		else
 			appendStringInfoString(buf, " DESC");
 
-		if (pathkey->pk_nulls_first)
-			appendStringInfoString(buf, " NULLS FIRST");
-		else
-			appendStringInfoString(buf, " NULLS LAST");
+		// if (pathkey->pk_nulls_first)
+		// 	appendStringInfoString(buf, " NULLS FIRST");
+		// else
+		// 	appendStringInfoString(buf, " NULLS LAST");
 
 		delim = ", ";
 	}

@@ -373,29 +373,16 @@ get_foreignPlanSimple__(PlannerInfo *root,
 							remote_exprs, best_path->path.pathkeys,
 							false, &retrieved_attrs, &params_list);
 
-    /*   The sql query and the attributes are salted away
-     *   Will be used later in BeginForeignScan
-     */
+    /* goodies for begin_foreignScan */
 	fdw_private = list_make3(makeString(sql.data), retrieved_attrs, fpinfo);
 
 	/*
-	 * Create the ForeignScan node from target list, local filtering
-	 * expressions, remote parameter expressions, and FDW private information.
-	 *
-	 * Note that the remote parameter expressions are stored in the fdw_exprs
-	 * field of the finished plan node; we can't keep them in private state
-	 * because then they wouldn't be subject to later planner processing.
-     * params_list is what gets passed for fdw_exprs
+     * params_list -> fdw_exprs
+     * remote_exprs -> fdw_recheck_quals
 	 */
-	return make_foreignscan(tlist,
-	                        local_exprs,
-	                        baserel->relid,
-	                        params_list,
-	                        fdw_private,
-	                        NIL,
-	                        remote_exprs,
-	                        outer_plan
-	                       );
+	return make_foreignscan(tlist, local_exprs, baserel->relid,
+	                        params_list, fdw_private, NIL,
+	                        remote_exprs, outer_plan);
 }
 
 
@@ -493,27 +480,17 @@ get_foreignPlanJoinUpper__(PlannerInfo *root,
 	/* Remember remote_exprs for possible use by postgresPlanDirectModify */
 	// fpinfo->final_remote_exprs = remote_exprs;
 
-	/*
-	 * Build the fdw_private list that will be available to the executor.
-	 * Items in the list must match order in enum FdwScanPrivateIndex.
-	 */
+    /* goodies for begin_foreginScan */
 	fdw_private = list_make3(makeString(sql.data), retrieved_attrs, fpinfo);
 	
     /*
-	 * Create the ForeignScan node for the given relation.
-	 *
-	 * Note that the remote parameter expressions are stored in the fdw_exprs
-	 * field of the finished plan node; we can't keep them in private state
-	 * because then they wouldn't be subject to later planner processing.
+     * scanrelid -> 0 for join and upper
+     * params_list -> fdw_exprs
+     * fdw_recheck_quals -> NULL
 	 */
-	return make_foreignscan(tlist,
-							local_exprs,
-							0,
-							params_list,
-							fdw_private,
-							fdw_scan_tlist,
-							NULL,
-							outer_plan);
+	return make_foreignscan(tlist, local_exprs, 0,
+							params_list, fdw_private, fdw_scan_tlist,
+							NULL, outer_plan);
 }
 
 
@@ -695,8 +672,6 @@ begin_foreignScan(ForeignScanState *node, int eflags)
     PG_TRY();
     {
         festate->stmt = prepare_sqliteQuery(festate->db, festate->query, NULL);
-	    elog(SQLITE_FDW_LOG_LEVEL, "the number of parameters is %d",
-                list_length(fsplan->fdw_exprs));
         if ( list_length(fsplan->fdw_exprs) > 0 )
             sqlite_bind_param_values(festate, fsplan->fdw_exprs, node);
     }

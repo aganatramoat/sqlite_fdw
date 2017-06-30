@@ -48,7 +48,7 @@ sqlite_fdw_handler(PG_FUNCTION_ARGS)
 {
 	FdwRoutine *routine = makeNode(FdwRoutine);
 
-	/* these are required */
+	/* required */
 	routine->GetForeignRelSize = get_foreignRelSize;
 	routine->GetForeignPaths = get_foreignPaths;
 	routine->GetForeignPlan = get_foreignPlan;
@@ -57,30 +57,11 @@ sqlite_fdw_handler(PG_FUNCTION_ARGS)
 	routine->ReScanForeignScan = rescan_foreignScan;
 	routine->EndForeignScan = end_foreignScan;
 
-	/* remainder are optional - use NULL if not required */
-	/* support for insert / update / delete */
-	routine->AddForeignUpdateTargets = add_foreignUpdateTargets;
-	routine->PlanForeignModify = plan_foreignModify;
-	routine->BeginForeignModify = begin_foreignModify;
-	routine->ExecForeignInsert = exec_foreignInsert;
-	routine->ExecForeignUpdate = exec_foreginUpdate;
-	routine->ExecForeignDelete = exec_foreignDelete;
-	routine->EndForeignModify = end_foreignModify;
-
-	/* support for EXPLAIN */
+    /* optional */
 	routine->ExplainForeignScan = explain_foreignScan;
-	routine->ExplainForeignModify = explain_foreignModify;
-
-	/* support for ANALYSE */
 	routine->AnalyzeForeignTable = analyze_foreignTable;
-
-	/* support for IMPORT FOREIGN SCHEMA */
 	routine->ImportForeignSchema = import_foreignSchema;
-	
-    /* Support functions for join push-down */
 	routine->GetForeignJoinPaths = get_foreignJoinPaths;
-	
-    /* Support functions for upper relation push-down */
 	routine->GetForeignUpperPaths = get_foreignUpperPaths;
 
 	PG_RETURN_POINTER(routine);

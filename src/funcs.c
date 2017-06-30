@@ -1198,40 +1198,32 @@ file_exists(const char *name)
 }
 
 
-
 void
-sqlite_bind_param_values(SqliteFdwExecutionState *festate, List *fdw_exprs, 
-                         ForeignScanState *node)
+sqlite_bind_param_values(ForeignScanState *node)
 {
-	ListCell   *lc;
-    Oid  *param_types;
-	List *param_exprs;
-    int i;
-    MemoryContext oldcontext;
-
-    param_exprs = (List *) ExecInitExpr((Expr *) fdw_exprs, (PlanState *)node);
-    param_types = (Oid *) palloc0(sizeof(Oid) * list_length(fdw_exprs));
-    
-    i = 0;
-    foreach(lc, fdw_exprs)
-		param_types[i++] = exprType((Node *) lfirst(lc));
-
-    oldcontext = MemoryContextSwitchTo(
+	SqliteFdwExecutionState   *festate = (SqliteFdwExecutionState *) 
+                                          node->fdw_state;
+    List * fdw_exprs = ((ForeignScan *) node->ss.ps.plan)->fdw_exprs;
+    MemoryContext oldcontext = MemoryContextSwitchTo(
                     node->ss.ps.ps_ExprContext->ecxt_per_tuple_memory);
-
-    i = 0;
-    foreach(lc, param_exprs)
+	ListCell   *lc, *lcf;
+    int i = 0;
+    
+    forboth(lc, festate->param_exprs, lcf, fdw_exprs)
 	{
 		ExprState  *expr_state = (ExprState *) lfirst(lc);
 		Datum		expr_value;
 		bool		isNull;
+        Oid         ptype = exprType((Node *) lfirst(lcf));
 
 		/* Evaluate the parameter expression */
-		expr_value = ExecEvalExpr(expr_state, node->ss.ps.ps_ExprContext, &isNull);
-        sqlite_bind_param_value(festate, i+1, param_types[i], expr_value, isNull);
+		expr_value = ExecEvalExpr(expr_state, node->ss.ps.ps_ExprContext, 
+                                  &isNull);
+        sqlite_bind_param_value(festate, i+1, ptype, expr_value, isNull);
         i++;
     }
     MemoryContextSwitchTo(oldcontext);
+    festate->params_bound = true;
 }
 
 

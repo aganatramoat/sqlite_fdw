@@ -104,11 +104,6 @@ static void deparseTargetList(StringInfo buf,
 static void deparseExplicitTargetList(List *tlist, List **retrieved_attrs,
 						  deparse_expr_cxt *context);
 static void deparseSubqueryTargetList(deparse_expr_cxt *context);
-static void deparseReturningList(StringInfo buf, PlannerInfo *root,
-					 Index rtindex, Relation rel,
-					 bool trig_after_row,
-					 List *returningList,
-					 List **retrieved_attrs);
 static void deparseColumnRef(StringInfo buf, int varno, int varattno,
 				 PlannerInfo *root, bool qualify_col);
 static void deparseRelation(StringInfo buf, Relation rel);
@@ -188,7 +183,7 @@ foreign_expr_walker(Node *node,
 		return true;
 
 	/* May need server info from baserel's fdw_private struct */
-	fpinfo = (SqliteFdwRelationInfo *) (glob_cxt->foreignrel->fdw_private);
+	fpinfo = FDW_RELINFO(glob_cxt->foreignrel->fdw_private);
 
 	/* Set up inner_cxt for possible recursion to child nodes */
 	inner_cxt.collation = InvalidOid;
@@ -754,7 +749,7 @@ List *
 build_tlist_to_deparse(RelOptInfo *foreignrel)
 {
 	List	   *tlist = NIL;
-	SqliteFdwRelationInfo *fpinfo = (SqliteFdwRelationInfo *) foreignrel->fdw_private;
+	SqliteFdwRelationInfo *fpinfo = FDW_RELINFO(foreignrel->fdw_private);
 	ListCell   *lc;
 
 	/*
@@ -814,7 +809,7 @@ deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
 						List **params_list)
 {
 	deparse_expr_cxt context;
-	SqliteFdwRelationInfo *fpinfo = (SqliteFdwRelationInfo *) rel->fdw_private;
+	SqliteFdwRelationInfo *fpinfo = FDW_RELINFO(rel->fdw_private);
 	List	*quals;
 
 	/*
@@ -839,8 +834,7 @@ deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
 	 * supplied list of remote conditions directly.
 	 */
 	if (IS_UPPER_REL(rel))
-		quals = ((SqliteFdwRelationInfo *) fpinfo->grouped_rel->fdw_private)->
-                    remote_conds;
+		quals = FDW_RELINFO(fpinfo->grouped_rel->fdw_private)->remote_conds;
 	else
 		quals = remote_conds;
 
@@ -870,7 +864,8 @@ deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
     /*
      * Sqlite's ACID model implies that updates are serializable see:
      * https://sqlite.org/lockingv3.html
-     * Hence we will have no need for locking clauses
+     * Hence we will have no need for locking clauses even if/when 
+     * we were to support inserts, updates and deletes
      */
 }
 
@@ -894,7 +889,8 @@ deparseSelectSql(List *tlist, bool is_subquery, List **retrieved_attrs,
 	StringInfo	buf = context->buf;
 	RelOptInfo *foreignrel = context->foreignrel;
 	PlannerInfo *root = context->root;
-	SqliteFdwRelationInfo *fpinfo = (SqliteFdwRelationInfo *) foreignrel->fdw_private;
+	SqliteFdwRelationInfo *fpinfo = (SqliteFdwRelationInfo *) 
+                                    foreignrel->fdw_private;
 
 	/*
 	 * Construct SELECT list
@@ -1342,274 +1338,6 @@ deparseRangeTblRef(StringInfo buf, PlannerInfo *root, RelOptInfo *foreignrel,
 		deparseFromExprForRel(buf, root, foreignrel, true, params_list);
 }
 
-/*
- * deparse remote INSERT statement
- *
- * The statement text is appended to buf, and we also create an integer List
- * of the columns being retrieved by RETURNING (if any), which is returned
- * to *retrieved_attrs.
- */
-void
-deparseInsertSql(StringInfo buf, PlannerInfo *root,
-				 Index rtindex, Relation rel,
-				 List *targetAttrs, bool doNothing,
-				 List *returningList, List **retrieved_attrs)
-{
-	AttrNumber	pindex;
-	bool		first;
-	ListCell   *lc;
-
-	appendStringInfoString(buf, "INSERT INTO ");
-	deparseRelation(buf, rel);
-
-	if (targetAttrs)
-	{
-		appendStringInfoChar(buf, '(');
-
-		first = true;
-		foreach(lc, targetAttrs)
-		{
-			int			attnum = lfirst_int(lc);
-
-			if (!first)
-				appendStringInfoString(buf, ", ");
-			first = false;
-
-			deparseColumnRef(buf, rtindex, attnum, root, false);
-		}
-
-		appendStringInfoString(buf, ") VALUES (");
-
-		pindex = 1;
-		first = true;
-		foreach(lc, targetAttrs)
-		{
-			if (!first)
-				appendStringInfoString(buf, ", ");
-			first = false;
-
-			appendStringInfo(buf, "$%d", pindex);
-			pindex++;
-		}
-
-		appendStringInfoChar(buf, ')');
-	}
-	else
-		appendStringInfoString(buf, " DEFAULT VALUES");
-
-	if (doNothing)
-		appendStringInfoString(buf, " ON CONFLICT DO NOTHING");
-
-	deparseReturningList(buf, root, rtindex, rel,
-					   rel->trigdesc && rel->trigdesc->trig_insert_after_row,
-						 returningList, retrieved_attrs);
-}
-
-/*
- * deparse remote UPDATE statement
- *
- * The statement text is appended to buf, and we also create an integer List
- * of the columns being retrieved by RETURNING (if any), which is returned
- * to *retrieved_attrs.
- */
-void
-deparseUpdateSql(StringInfo buf, PlannerInfo *root,
-				 Index rtindex, Relation rel,
-				 List *targetAttrs, List *returningList,
-				 List **retrieved_attrs)
-{
-	AttrNumber	pindex;
-	bool		first;
-	ListCell   *lc;
-
-	appendStringInfoString(buf, "UPDATE ");
-	deparseRelation(buf, rel);
-	appendStringInfoString(buf, " SET ");
-
-	pindex = 2;					/* ctid is always the first param */
-	first = true;
-	foreach(lc, targetAttrs)
-	{
-		int			attnum = lfirst_int(lc);
-
-		if (!first)
-			appendStringInfoString(buf, ", ");
-		first = false;
-
-		deparseColumnRef(buf, rtindex, attnum, root, false);
-		appendStringInfo(buf, " = $%d", pindex);
-		pindex++;
-	}
-	appendStringInfoString(buf, " WHERE ctid = $1");
-
-	deparseReturningList(buf, root, rtindex, rel,
-					   rel->trigdesc && rel->trigdesc->trig_update_after_row,
-						 returningList, retrieved_attrs);
-}
-
-/*
- * deparse remote UPDATE statement
- *
- * The statement text is appended to buf, and we also create an integer List
- * of the columns being retrieved by RETURNING (if any), which is returned
- * to *retrieved_attrs.
- */
-void
-deparseDirectUpdateSql(StringInfo buf, PlannerInfo *root,
-					   Index rtindex, Relation rel,
-					   List *targetlist,
-					   List *targetAttrs,
-					   List *remote_conds,
-					   List **params_list,
-					   List *returningList,
-					   List **retrieved_attrs)
-{
-	RelOptInfo *baserel = root->simple_rel_array[rtindex];
-	deparse_expr_cxt context;
-	int			nestlevel;
-	bool		first;
-	ListCell   *lc;
-
-	/* Set up context struct for recursion */
-	context.root = root;
-	context.foreignrel = baserel;
-	context.scanrel = baserel;
-	context.buf = buf;
-	context.params_list = params_list;
-
-	appendStringInfoString(buf, "UPDATE ");
-	deparseRelation(buf, rel);
-	appendStringInfoString(buf, " SET ");
-
-	/* Make sure any constants in the exprs are printed portably */
-	nestlevel = set_transmission_modes();
-
-	first = true;
-	foreach(lc, targetAttrs)
-	{
-		int			attnum = lfirst_int(lc);
-		TargetEntry *tle = get_tle_by_resno(targetlist, attnum);
-
-		if (!tle)
-			elog(ERROR, "attribute number %d not found in UPDATE targetlist",
-				 attnum);
-
-		if (!first)
-			appendStringInfoString(buf, ", ");
-		first = false;
-
-		deparseColumnRef(buf, rtindex, attnum, root, false);
-		appendStringInfoString(buf, " = ");
-		deparseExpr((Expr *) tle->expr, &context);
-	}
-
-	reset_transmission_modes(nestlevel);
-
-	if (remote_conds)
-	{
-		appendStringInfo(buf, " WHERE ");
-		appendConditions(remote_conds, &context);
-	}
-
-	deparseReturningList(buf, root, rtindex, rel, false,
-						 returningList, retrieved_attrs);
-}
-
-/*
- * deparse remote DELETE statement
- *
- * The statement text is appended to buf, and we also create an integer List
- * of the columns being retrieved by RETURNING (if any), which is returned
- * to *retrieved_attrs.
- */
-void
-deparseDeleteSql(StringInfo buf, PlannerInfo *root,
-				 Index rtindex, Relation rel,
-				 List *returningList,
-				 List **retrieved_attrs)
-{
-	appendStringInfoString(buf, "DELETE FROM ");
-	deparseRelation(buf, rel);
-	appendStringInfoString(buf, " WHERE ctid = $1");
-
-	deparseReturningList(buf, root, rtindex, rel,
-					   rel->trigdesc && rel->trigdesc->trig_delete_after_row,
-						 returningList, retrieved_attrs);
-}
-
-/*
- * deparse remote DELETE statement
- *
- * The statement text is appended to buf, and we also create an integer List
- * of the columns being retrieved by RETURNING (if any), which is returned
- * to *retrieved_attrs.
- */
-void
-deparseDirectDeleteSql(StringInfo buf, PlannerInfo *root,
-					   Index rtindex, Relation rel,
-					   List *remote_conds,
-					   List **params_list,
-					   List *returningList,
-					   List **retrieved_attrs)
-{
-	RelOptInfo *baserel = root->simple_rel_array[rtindex];
-	deparse_expr_cxt context;
-
-	/* Set up context struct for recursion */
-	context.root = root;
-	context.foreignrel = baserel;
-	context.scanrel = baserel;
-	context.buf = buf;
-	context.params_list = params_list;
-
-	appendStringInfoString(buf, "DELETE FROM ");
-	deparseRelation(buf, rel);
-
-	if (remote_conds)
-	{
-		appendStringInfo(buf, " WHERE ");
-		appendConditions(remote_conds, &context);
-	}
-
-	deparseReturningList(buf, root, rtindex, rel, false,
-						 returningList, retrieved_attrs);
-}
-
-/*
- * Add a RETURNING clause, if needed, to an INSERT/UPDATE/DELETE.
- */
-static void
-deparseReturningList(StringInfo buf, PlannerInfo *root,
-					 Index rtindex, Relation rel,
-					 bool trig_after_row,
-					 List *returningList,
-					 List **retrieved_attrs)
-{
-	Bitmapset  *attrs_used = NULL;
-
-	if (trig_after_row)
-	{
-		/* whole-row reference acquires all non-system columns */
-		attrs_used =
-			bms_make_singleton(0 - FirstLowInvalidHeapAttributeNumber);
-	}
-
-	if (returningList != NIL)
-	{
-		/*
-		 * We need the attrs, non-system and system, mentioned in the local
-		 * query's RETURNING list.
-		 */
-		pull_varattnos((Node *) returningList, rtindex,
-					   &attrs_used);
-	}
-
-	if (attrs_used != NULL)
-		deparseTargetList(buf, root, rtindex, rel, true, attrs_used, false,
-						  retrieved_attrs);
-	else
-		*retrieved_attrs = NIL;
-}
 
 /*
  * Construct SELECT statement to acquire size in blocks of given relation.
@@ -2892,7 +2620,7 @@ deparseSortGroupClause(Index ref, List *tlist, deparse_expr_cxt *context)
 static bool
 is_subquery_var(Var *node, RelOptInfo *foreignrel, int *relno, int *colno)
 {
-	SqliteFdwRelationInfo *fpinfo = (SqliteFdwRelationInfo *) foreignrel->fdw_private;
+	SqliteFdwRelationInfo *fpinfo = FDW_RELINFO(foreignrel->fdw_private);
 	RelOptInfo *outerrel = fpinfo->joinspec.outerrel;
 	RelOptInfo *innerrel = fpinfo->joinspec.innerrel;
 
@@ -2955,7 +2683,7 @@ static void
 get_relation_column_alias_ids(Var *node, RelOptInfo *foreignrel,
 							  int *relno, int *colno)
 {
-	SqliteFdwRelationInfo *fpinfo = (SqliteFdwRelationInfo *) foreignrel->fdw_private;
+	SqliteFdwRelationInfo *fpinfo = FDW_RELINFO(foreignrel->fdw_private);
 	int			i;
 	ListCell   *lc;
 

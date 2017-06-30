@@ -121,19 +121,21 @@ typedef struct
 } ec_member_foreign_arg;
 
 
-typedef struct SqliteFdwExecutionState
+typedef struct
 {
 	struct sqlite3 *db;
 	struct sqlite3_stmt  *stmt;
-	char          *query;
-	List          *retrieved_attrs;   /* list of target attribute numbers */
+	char   *query;
+	List   *retrieved_attrs;   /* list of target attribute numbers */
+    List   *param_exprs;
+    bool   params_bound;
 } SqliteFdwExecutionState;
 
 
 /*
  * Global context for foreign_expr_walker's search of an expression tree.
  */
-typedef struct foreign_glob_cxt
+typedef struct
 {
 	PlannerInfo *root;			/* global planner state */
 	RelOptInfo *foreignrel;		/* the foreign relation we are planning for */
@@ -157,7 +159,7 @@ typedef enum
 } FDWCollateState;
 
 
-typedef struct foreign_loc_cxt
+typedef struct
 {
 	Oid			collation;		/* OID of current collation, if any */
 	FDWCollateState state;		/* state of current collation choice */
@@ -172,32 +174,6 @@ bool is_shippable(Oid objectId, Oid classId, SqliteFdwRelationInfo *fpinfo);
 // from deparse.c
 List * build_tlist_to_deparse(RelOptInfo *foreignrel);
 const char * get_jointype_name(JoinType jointype);
-void deparseInsertSql(StringInfo buf, PlannerInfo *root,
-				      Index rtindex, Relation rel,
-				      List *targetAttrs, bool doNothing,
-				      List *returningList, List **retrieved_attrs);
-void deparseUpdateSql(StringInfo buf, PlannerInfo *root,
-				      Index rtindex, Relation rel,
-				      List *targetAttrs, List *returningList,
-				      List **retrieved_attrs);
-void deparseDirectUpdateSql(StringInfo buf, PlannerInfo *root,
-					        Index rtindex, Relation rel,
-					        List *targetlist,
-					        List *targetAttrs,
-					        List *remote_conds,
-					        List **params_list,
-					        List *returningList,
-					        List **retrieved_attrs);
-void deparseDeleteSql(StringInfo buf, PlannerInfo *root,
-				      Index rtindex, Relation rel,
-				      List *returningList,
-				      List **retrieved_attrs);
-void deparseDirectDeleteSql(StringInfo buf, PlannerInfo *root,
-					        Index rtindex, Relation rel,
-					        List *remote_conds,
-					        List **params_list,
-					        List *returningList,
-					        List **retrieved_attrs);
 void deparseAnalyzeSizeSql(StringInfo buf, Relation rel);
 void deparseStringLiteral(StringInfo buf, const char *val);
 void deparseAnalyzeSql(StringInfo buf, Relation rel, List **retrieved_attrs);
@@ -215,9 +191,7 @@ void add_pathsWithPathKeysForRel(PlannerInfo *root, RelOptInfo *rel,
 void estimate_path_cost_size(PlannerInfo *root, RelOptInfo *baserel,
 						     List *join_conds, List *pathkeys,
                              SqliteRelationCostSize *costs);
-void sqlite_bind_param_values(SqliteFdwExecutionState *festate,
-                              List *fdw_exprs, 
-                              ForeignScanState * node);
+void sqlite_bind_param_values(ForeignScanState * node);
 void cleanup_(SqliteFdwExecutionState *);
 SqliteTableSource get_tableSource(Oid foreigntableid);
 struct sqlite3_stmt * prepare_sqliteQuery(struct sqlite3 *db, char *query, 
@@ -247,9 +221,6 @@ void estimate_path_cost_size(PlannerInfo *root,
 						List *pathkeys,
                         SqliteRelationCostSize * store);
 bool file_exists(const char *name);
-void sqlite_bind_param_values(SqliteFdwExecutionState *festate, 
-                              List *fdw_exprs, 
-                              ForeignScanState *node);
 void cleanup_(SqliteFdwExecutionState *festate);
 void add_pathsWithPathKeysForRel(PlannerInfo *root, RelOptInfo *rel,
 								 Path *epq_path);
@@ -260,6 +231,8 @@ bool ec_member_matches_foreign(PlannerInfo *root, RelOptInfo *rel,
 int set_transmission_modes(void);
 Expr * find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel);
 void reset_transmission_modes(int nestlevel);
+
+#define FDW_RELINFO(X)  ((SqliteFdwRelationInfo *)X)
 
 
 // #pragma GCC visibility pop

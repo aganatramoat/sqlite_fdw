@@ -759,13 +759,11 @@ classifyConditions(PlannerInfo *root,
  * Returns true if given expr is safe to evaluate on the foreign server.
  */
 bool
-is_foreign_expr(PlannerInfo *root,
-				RelOptInfo *baserel,
-				Expr *expr)
+is_foreign_expr(PlannerInfo *root, RelOptInfo *baserel, Expr *expr)
 {
 	foreign_glob_cxt glob_cxt;
 	foreign_loc_cxt loc_cxt;
-	SqliteFdwRelationInfo *fpinfo = (SqliteFdwRelationInfo *) (baserel->fdw_private);
+	SqliteFdwRelationInfo *fpinfo = FDW_RELINFO(baserel->fdw_private);
 
 	/*
 	 * Check that the expression consists of nodes that are safe to execute
@@ -783,7 +781,8 @@ is_foreign_expr(PlannerInfo *root,
 		glob_cxt.relids = fpinfo->grouped_rel->relids;
 	else
 		glob_cxt.relids = baserel->relids;
-	loc_cxt.collation = InvalidOid;
+	
+    loc_cxt.collation = InvalidOid;
 	loc_cxt.state = FDW_COLLATE_NONE;
 	if (!foreign_expr_walker((Node *) expr, &glob_cxt, &loc_cxt))
 		return false;
@@ -882,8 +881,7 @@ estimate_join_rel_cost(PlannerInfo *root,
 					   RelOptInfo *foreignrel,
                        SqliteCostEstimates * est)
 {
-	SqliteFdwRelationInfo *fpinfo = (SqliteFdwRelationInfo *) 
-                                    foreignrel->fdw_private;
+	SqliteFdwRelationInfo *fpinfo = FDW_RELINFO(foreignrel->fdw_private);
     SqliteFdwRelationInfo *fpinfo_i;
     SqliteFdwRelationInfo *fpinfo_o;
     QualCost	join_cost;
@@ -893,8 +891,8 @@ estimate_join_rel_cost(PlannerInfo *root,
     /* For join we expect inner and outer relations set */
     Assert(fpinfo->joinspec.innerrel && fpinfo->joinspec.outerrel);
 
-    fpinfo_i = (SqliteFdwRelationInfo *) fpinfo->joinspec.innerrel->fdw_private;
-    fpinfo_o = (SqliteFdwRelationInfo *) fpinfo->joinspec.outerrel->fdw_private;
+    fpinfo_i = FDW_RELINFO(fpinfo->joinspec.innerrel->fdw_private);
+    fpinfo_o = FDW_RELINFO(fpinfo->joinspec.outerrel->fdw_private);
 
     /* Estimate of number of rows in cross product */
     nrows = fpinfo_i->costsize.rows * fpinfo_o->costsize.rows;
@@ -959,9 +957,8 @@ estimate_upper_rel_cost(PlannerInfo *root,
 					    RelOptInfo *foreignrel,
                         SqliteCostEstimates * est)
 {
-	SqliteFdwRelationInfo *fpinfo = (SqliteFdwRelationInfo *) 
-                                    foreignrel->fdw_private;
-    SqliteFdwRelationInfo *ofpinfo;
+	SqliteFdwRelationInfo *fpinfo = FDW_RELINFO(foreignrel->fdw_private);
+    SqliteFdwRelationInfo *ofpinfo = FDW_RELINFO(fpinfo->grouped_rel->fdw_private);
     PathTarget *ptarget = root->upper_targets[UPPERREL_GROUP_AGG];
     AggClauseCosts aggcosts;
     double		input_rows;
@@ -980,8 +977,6 @@ estimate_upper_rel_cost(PlannerInfo *root,
      * considering remote and local conditions for costing.
      */
 
-    ofpinfo = (SqliteFdwRelationInfo *) fpinfo->grouped_rel->fdw_private;
-
     /* Get rows and width from input rel */
     input_rows = ofpinfo->costsize.rows;
     // width = ofpinfo->cost.width;
@@ -998,10 +993,11 @@ estimate_upper_rel_cost(PlannerInfo *root,
 
     /* Get number of grouping columns and possible number of groups */
     numGroupCols = list_length(root->parse->groupClause);
-    numGroups = estimate_num_groups(root,
+    numGroups = estimate_num_groups(
+                    root,
                     get_sortgrouplist_exprs(root->parse->groupClause,
                                             fpinfo->grouped_tlist),
-                                    input_rows, NULL);
+                    input_rows, NULL);
 
     /*
      * Number of rows expected from foreign server will be same as
@@ -1085,8 +1081,7 @@ estimate_path_cost_size(PlannerInfo *root,
 						List *pathkeys,
                         SqliteRelationCostSize * store)
 {
-	SqliteFdwRelationInfo *fpinfo = (SqliteFdwRelationInfo *) 
-                                     foreignrel->fdw_private;
+	SqliteFdwRelationInfo *fpinfo = FDW_RELINFO(foreignrel->fdw_private);
     SqliteCostEstimates est = {0};
 
     /*

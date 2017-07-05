@@ -24,7 +24,10 @@
 #include "postgres.h"
 
 #include "access/transam.h"
+#include "access/htup_details.h"
 #include "catalog/dependency.h"
+#include "catalog/pg_proc.h"
+#include "catalog/pg_namespace.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
 #include "utils/syscache.h"
@@ -214,4 +217,37 @@ is_shippable(Oid objectId, Oid classId, SqliteFdwRelationInfo *fpinfo)
 	}
 
 	return entry->shippable;
+}
+
+
+static bool
+is_inarray(char const *teststr, char const **array, int len)
+{
+    for(int i = 0; i < len; i++)
+        if (strcmp(teststr, array[i]) == 0)
+            return true;
+    return false;
+}
+
+
+bool
+is_shippable_agg(Oid funcid)
+{
+    HeapTuple proctup = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcid));
+    Form_pg_proc procform;
+    bool isvalid = false;
+    char const *allowed_funcs[] = {"avg", "average", "max", "min", "sum"};
+    
+    if (!HeapTupleIsValid(proctup))
+        elog(ERROR, "cache lookup failed for function %u", funcid);
+    
+    procform = (Form_pg_proc) GETSTRUCT(proctup);
+    if (procform->pronamespace == PG_CATALOG_NAMESPACE)
+        isvalid = is_inarray(
+            NameStr(procform->proname), 
+            allowed_funcs, 
+            sizeof(allowed_funcs) / sizeof(allowed_funcs[0]));
+    
+    ReleaseSysCache(proctup);
+    return isvalid;
 }

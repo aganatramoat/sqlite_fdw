@@ -169,6 +169,7 @@ typedef struct
 // from shippable.c
 bool is_builtin(Oid objectId);
 bool is_shippable(Oid objectId, Oid classId, SqliteFdwRelationInfo *fpinfo);
+bool is_shippable_agg(Oid funcid);
 
 
 // from deparse.c

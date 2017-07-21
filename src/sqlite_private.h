@@ -30,15 +30,8 @@ typedef struct
 	double		rows;
 	int			width;
 	Cost		startup_cost;
+    Cost        run_cost;
 	Cost		total_cost;
-	
-    /* Costs excluding costs for transferring data from the foreign server */
-	Cost		rel_startup_cost;
-	Cost		rel_total_cost;
-
-    /* Other costs */
-    Cost  fdw_startup_cost;
-    Cost  fdw_tuple_cost;
 } SqliteRelationCostSize;
 
 
@@ -170,6 +163,7 @@ typedef struct
 bool is_builtin(Oid objectId);
 bool is_shippable(Oid objectId, Oid classId, SqliteFdwRelationInfo *fpinfo);
 bool is_shippable_agg(Oid funcid);
+bool is_shippable_func(Oid funcid);
 
 
 // from deparse.c
@@ -182,16 +176,13 @@ void deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
 						List *tlist, List *remote_conds, List *pathkeys,
 						bool is_subquery, List **retrieved_attrs,
 						List **params_list);
-bool foreign_expr_walker(Node *node, foreign_glob_cxt *glob_cxt,
-					     foreign_loc_cxt *outer_cxt);
+bool foreign_expr_walker(Node *node, Oid *expr_collid, Oid *expected_collid);
 
 
 // from funcs.c
 void add_pathsWithPathKeysForRel(PlannerInfo *root, RelOptInfo *rel,
                                      Path *epq_path);
-void estimate_path_cost_size(PlannerInfo *root, RelOptInfo *baserel,
-						     List *join_conds, List *pathkeys,
-                             SqliteRelationCostSize *costs);
+void estimate_path_cost_size(PlannerInfo *root, RelOptInfo *baserel);
 void sqlite_bind_param_values(ForeignScanState * node);
 void cleanup_(SqliteFdwExecutionState *);
 SqliteTableSource get_tableSource(Oid foreigntableid);
@@ -216,11 +207,6 @@ SqliteTableImportOptions get_sqliteTableImportOptions(
         ImportForeignSchemaStmt *stmt);
 void sqlite_bind_param_value(SqliteFdwExecutionState *festate,
                         int index, Oid ptype, Datum pval, bool isNull);
-void estimate_path_cost_size(PlannerInfo *root,
-						RelOptInfo *foreignrel,
-						List *param_join_conds,
-						List *pathkeys,
-                        SqliteRelationCostSize * store);
 bool file_exists(const char *name);
 void cleanup_(SqliteFdwExecutionState *festate);
 void add_pathsWithPathKeysForRel(PlannerInfo *root, RelOptInfo *rel,

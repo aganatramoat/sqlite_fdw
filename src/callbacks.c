@@ -29,8 +29,7 @@
 void
 get_foreignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid)
 {
-	SqliteFdwRelationInfo *fpinfo = (SqliteFdwRelationInfo *) 
-                                     baserel->fdw_private;
+	SqliteFdwRelationInfo *fpinfo = FDW_RELINFO(baserel->fdw_private);
 	ForeignPath *path;
 	List	   *ppi_list;
 	ListCell   *lc;
@@ -182,24 +181,19 @@ get_foreignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid)
 	foreach(lc, ppi_list)
 	{
 		ParamPathInfo *param_info = (ParamPathInfo *) lfirst(lc);
-        SqliteRelationCostSize est;
-
-		/* Get a cost estimate from the remote */
-		estimate_path_cost_size(root, baserel,
-								param_info->ppi_clauses, NIL, &est);
 
 		/*
 		 * ppi_rows currently won't get looked at by anything, but still we
 		 * may as well ensure that it matches our idea of the rowcount.
 		 */
-		param_info->ppi_rows = est.rows;
+		param_info->ppi_rows = fpinfo->costsize.rows;
 
 		/* Make the path */
 		path = create_foreignscan_path(root, baserel,
 									   NULL,	/* default pathtarget */
-									   est.rows,
-									   est.startup_cost,
-									   est.total_cost,
+									   fpinfo->costsize.rows,
+									   fpinfo->costsize.startup_cost,
+									   fpinfo->costsize.total_cost,
 									   NIL,		/* no pathkeys */
 									   param_info->ppi_req_outer,
 									   NULL,
@@ -209,6 +203,9 @@ get_foreignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid)
 }
 
     
+/*
+ * This is the first function that gets called back
+ */
 void
 get_foreignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid)
 {
@@ -221,6 +218,16 @@ get_foreignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid)
     fpinfo->src = get_tableSource(foreigntableid);
     fpinfo->pushdown_safe = true;
 	baserel->fdw_private = (void *) fpinfo;
+    
+	fpinfo->relation_name = makeStringInfo();
+	appendStringInfo(fpinfo->relation_name, "%s.%s",
+         quote_identifier(get_namespace_name(get_rel_namespace(foreigntableid))),
+         quote_identifier(get_rel_name(foreigntableid)));
+	
+	fpinfo->subqspec.make_outerrel = false;
+	fpinfo->subqspec.make_innerrel = false;
+	fpinfo->subqspec.lower_rels = NULL;
+	fpinfo->relation_index = baserel->relid;
     
     pull_varattnos((Node *) baserel->reltarget->exprs, 
                     baserel->relid, 
@@ -255,60 +262,18 @@ get_foreignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid)
                    fpinfo->local_conds, root);
 	
     /*
-	 * Set cached relation costs to some negative value, so that we can detect
-	 * when they are set to some sensible costs during one (usually the first)
-	 * of the calls to estimate_path_cost_size().
-	 */
-	fpinfo->costsize.rel_startup_cost = -1;
-	fpinfo->costsize.rel_total_cost = -1;
-
-    /*
-     *   We are going to assume that postgres is responsible for keeping 
-     *   the statistics for the foreign tables.  This saves us the major
-     *   headache of extracting/translating sqlite3 information
+     * We are going to assume that postgres is responsible for keeping 
+     * the statistics for the foreign tables.  This saves us the major
+     * headache of extracting/translating sqlite3 information
      */
     
-    /*
-     * If the foreign table has never been ANALYZEd, it will have relpages
-     * and reltuples equal to zero, which most likely has nothing to do
-     * with reality.  We can't do a whole lot about that if we're not
-     * allowed to consult the remote server, but we can use a hack similar
-     * to plancat.c's treatment of empty relations: use a minimum size
-     * estimate of 10 pages, and divide by the column-datatype-based width
-     * estimate to get the corresponding number of tuples.
+    /* 
+     * Estimate baserel size as best we can with local statistics.
+     * The following function will set baserel->rows and baserel->width
+     * and baserel->baserestrictcost
      */
-    if (baserel->pages == 0 && baserel->tuples == 0)
-    {
-        baserel->pages = 10;
-        baserel->tuples =
-            (10 * BLCKSZ) / (baserel->reltarget->width +
-                             MAXALIGN(SizeofHeapTupleHeader));
-    }
-
-    /* Estimate baserel size as best we can with local statistics. */
     set_baserel_size_estimates(root, baserel);
-
-    /* Fill in basically-bogus cost estimates for use later. */
-    estimate_path_cost_size(root, baserel, NIL, NIL, &fpinfo->costsize);
-	
-    /*
-	 * Set the name of relation in fpinfo, while we are constructing it here.
-	 * It will be used to build the string describing the join relation in
-	 * EXPLAIN output. We can't know whether VERBOSE option is specified or
-	 * not, so always schema-qualify the foreign table name.
-	 */
-	fpinfo->relation_name = makeStringInfo();
-	appendStringInfo(fpinfo->relation_name, "%s.%s",
-         quote_identifier(get_namespace_name(get_rel_namespace(foreigntableid))),
-         quote_identifier(get_rel_name(foreigntableid)));
-
-	/* No outer and inner relations. */
-	fpinfo->subqspec.make_outerrel = false;
-	fpinfo->subqspec.make_innerrel = false;
-	fpinfo->subqspec.lower_rels = NULL;
-	
-    /* Set the relation index. */
-	fpinfo->relation_index = baserel->relid;
+    estimate_path_cost_size(root, baserel);
 }
 
 
@@ -330,6 +295,7 @@ get_foreignPlanSimple__(PlannerInfo *root,
 	StringInfoData sql;
 	List           *retrieved_attrs;
 	ListCell       *lc;
+	List	       *fdw_scan_tlist = NULL;
 
     /*
 	 * Separate the scan_clauses into those that can be executed remotely and
@@ -368,8 +334,9 @@ get_foreignPlanSimple__(PlannerInfo *root,
 	}
 	
     /* Build the query */
+    fdw_scan_tlist = build_tlist_to_deparse(baserel);
 	initStringInfo(&sql);
-	deparseSelectStmtForRel(&sql, root, baserel, NULL,
+	deparseSelectStmtForRel(&sql, root, baserel, fdw_scan_tlist,
 							remote_exprs, best_path->path.pathkeys,
 							false, &retrieved_attrs, &params_list);
 
@@ -471,6 +438,15 @@ get_foreignPlanJoinUpper__(PlannerInfo *root,
                                                   qual);
         }
     }
+    
+    // elog(SQLITE_FDW_LOG_LEVEL,
+    //      "before deparse costs for grouping %f, %f, pointers are %p, %p, pid is %d", 
+    //      fpinfo->costsize.startup_cost, 
+    //      fpinfo->costsize.total_cost,
+    //      (void *) fpinfo,
+    //      (void *) (fpinfo->grouped_rel),
+    //      getpid());
+    //  raise(SIGSTOP);
 	
     initStringInfo(&sql);
 	deparseSelectStmtForRel(&sql, root, foreignrel, fdw_scan_tlist,
@@ -568,7 +544,7 @@ get_foreignJoinPaths(PlannerInfo *root, RelOptInfo *joinrel,
 	}
 	else
 		epq_path = NULL;
-
+    
 	if (!foreign_join_ok(root, joinrel, jointype, outerrel, innerrel, extra))
 	{
 		/* Free path required for EPQ if we copied one; we don't need it now */
@@ -576,7 +552,7 @@ get_foreignJoinPaths(PlannerInfo *root, RelOptInfo *joinrel,
 			pfree(epq_path);
 		return;
 	}
-
+    
 	/*
 	 * Compute the selectivity and cost of the local_conds, so we don't have
 	 * to do it over again for each path. The best we can do for these
@@ -599,8 +575,9 @@ get_foreignJoinPaths(PlannerInfo *root, RelOptInfo *joinrel,
                 extra->sjinfo);
 
 	/* Estimate costs for bare join relation */
-	estimate_path_cost_size(root, joinrel, NIL, NIL, &fpinfo->costsize);
-	/* Now update this information in the joinrel */
+	estimate_path_cost_size(root, joinrel);
+	
+    /* Now update this information in the joinrel */
 	joinrel->rows = fpinfo->costsize.rows;
 	joinrel->reltarget->width = fpinfo->costsize.width;
 
@@ -608,15 +585,12 @@ get_foreignJoinPaths(PlannerInfo *root, RelOptInfo *joinrel,
 	 * Create a new join path and add it to the joinrel which represents a
 	 * join between foreign tables.
 	 */
-    // AG TODO: the total cost is hardocded here
 	joinpath = create_foreignscan_path(root,
 									   joinrel,
 									   NULL,	/* default pathtarget */
 									   joinrel->rows,
-									   // fpinfo->costsize.startup_cost,
-									   0.0,
-									   // fpinfo->costs.total_cost,
-                                       1.0,
+									   fpinfo->costsize.startup_cost,
+									   fpinfo->costsize.total_cost,
 									   NIL,		/* no pathkeys */
 									   NULL,	/* no required_outer */
 									   epq_path,
@@ -693,8 +667,6 @@ import_foreignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
     ListCell       *lc;
     SqliteTableImportOptions importOptions = 
             get_sqliteTableImportOptions(stmt);
-
-	elog(SQLITE_FDW_LOG_LEVEL, "entering function %s", __func__);
 
 	/*
 	 * The only legit sqlite schema are temp and main, 
@@ -838,8 +810,6 @@ analyze_foreignTable(Relation relation, AcquireSampleRowsFunc *func,
 	 * the FDW does not have any concept of dead rows.)
 	 * ----
 	 */
-
-	elog(SQLITE_FDW_LOG_LEVEL,"entering function %s",__func__);
 
 	return false;
 }
@@ -1122,14 +1092,6 @@ foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouping_rel)
 	fpinfo->pushdown_safe = true;
 
 	/*
-	 * Set cached relation costs to some negative value, so that we can detect
-	 * when they are set to some sensible costs, during one (usually the
-	 * first) of the calls to estimate_path_cost_size().
-	 */
-	fpinfo->costsize.rel_startup_cost = -1;
-	fpinfo->costsize.rel_total_cost = -1;
-
-	/*
 	 * Set the string describing this grouped relation to be used in EXPLAIN
 	 * output of corresponding ForeignScan.
 	 */
@@ -1158,11 +1120,6 @@ add_foreign_grouping_paths(PlannerInfo *root, RelOptInfo *input_rel,
 	ForeignPath *grouppath;
 	PathTarget *grouping_target;
     
-    // elog(SQLITE_FDW_LOG_LEVEL,
-    //         "XXXXX add_foreign_grouping_paths pid of process is %d", 
-    //         getpid());
-    // raise(SIGSTOP);
-
 	/* Nothing to be done, if there is no grouping or aggregation required. */
 	if (!parse->groupClause && !parse->groupingSets && !parse->hasAggs &&
 		!root->hasHavingQual)
@@ -1173,13 +1130,22 @@ add_foreign_grouping_paths(PlannerInfo *root, RelOptInfo *input_rel,
 	/* save the input_rel as grouped_rel in fpinfo */
 	fpinfo->grouped_rel = input_rel;
     fpinfo->src.database = ifpinfo->src.database;
-
+    
 	/* Assess if it is safe to push down aggregation and grouping. */
 	if (!foreign_grouping_ok(root, grouping_rel))
 		return;
 
 	/* Estimate the cost of push down */
-	estimate_path_cost_size(root, grouping_rel, NIL, NIL, &fpinfo->costsize);
+	estimate_path_cost_size(root, grouping_rel);
+    
+    // elog(SQLITE_FDW_LOG_LEVEL,
+    //      "costs for grouping %f, %f, pointers are %p, %p, pid is %d", 
+    //      fpinfo->costsize.startup_cost, 
+    //      fpinfo->costsize.total_cost,
+    //      (void *) fpinfo,
+    //      (void *) (fpinfo->grouped_rel),
+    //      getpid());
+    // raise(SIGSTOP);
 
 	/* Create and add foreign path to the grouping relation. */
 	grouppath = create_foreignscan_path(root,

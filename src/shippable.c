@@ -230,24 +230,42 @@ is_inarray(char const *teststr, char const **array, int len)
 }
 
 
-bool
-is_shippable_agg(Oid funcid)
+static bool
+is_allowed_name(Oid funcid, char const *allowed_names[], size_t len)
 {
     HeapTuple proctup = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcid));
     Form_pg_proc procform;
     bool isvalid = false;
-    char const *allowed_funcs[] = {"avg", "average", "max", "min", "sum"};
     
     if (!HeapTupleIsValid(proctup))
         elog(ERROR, "cache lookup failed for function %u", funcid);
     
     procform = (Form_pg_proc) GETSTRUCT(proctup);
-    if (procform->pronamespace == PG_CATALOG_NAMESPACE)
+    if (procform->pronamespace == PG_CATALOG_NAMESPACE) {
         isvalid = is_inarray(
             NameStr(procform->proname), 
-            allowed_funcs, 
-            sizeof(allowed_funcs) / sizeof(allowed_funcs[0]));
+            allowed_names, 
+            len);
+    }
     
     ReleaseSysCache(proctup);
     return isvalid;
+}
+
+
+bool
+is_shippable_agg(Oid funcid)
+{
+    char const *allowed_names[] = {"avg", "average", "max", "min", "sum"};
+    return is_allowed_name(funcid, allowed_names, 
+                           sizeof(allowed_names) / sizeof(allowed_names[0]));
+}
+
+    
+bool
+is_shippable_func(Oid funcid)
+{
+    char const *allowed_names[] = {"abs", "coalesce"};
+    return is_allowed_name(funcid, allowed_names, 
+                           sizeof(allowed_names) / sizeof(allowed_names[0]));
 }

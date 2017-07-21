@@ -66,7 +66,7 @@
 /*
  * Context for deparseExpr
  */
-typedef struct deparse_expr_cxt
+typedef struct deparse_expr_cxt 
 {
 	PlannerInfo *root;			/* global planner state */
 	RelOptInfo *foreignrel;		/* the foreign relation we are planning for */
@@ -153,168 +153,64 @@ static void get_relation_column_alias_ids(Var *node, RelOptInfo *foreignrel,
 										  int *relno, int *colno);
 
 
-static FDWCollateState
-get_collationState__(Oid collid)
-{
-    if (collid == InvalidOid || collid == DEFAULT_COLLATION_OID)
-        return FDW_COLLATE_NONE;
-    else
-        return FDW_COLLATE_UNSAFE;
-}
-
-
 /*
  * Check if expression is safe to execute remotely, and return true if so.
  *
- * In addition, *outer_cxt is updated with collation information.
+ * The collation of the expr is reported in expr_collid
+ * If we expect the collation of the expr to be something,
+ * we pass that along as expected_collid
  *
- * We must check that the expression contains only node types we can deparse,
- * that all types/functions/operators are safe to send (they are "shippable"),
- * and that all collations used in the expression derive from Vars of the
- * foreign table.  Because of the latter, the logic is pretty close to
- * assign_collations_walker() in parse_collate.c, though we can assume here
- * that the given expression is valid.  Note function mutability is not
- * currently considered here.
+ * For the moment the fdw ships the default collation to sqlite3. 
+ * If we were ever to extend that to shipping all collations then 
+ * this function has to change
  */
 bool
-foreign_expr_walker(Node *node,
-					foreign_glob_cxt *glob_cxt,
-					foreign_loc_cxt *outer_cxt)
+foreign_expr_walker(Node *node, Oid *expr_collid, Oid *expected_collid)
 {
-	bool		check_type = true;
-	SqliteFdwRelationInfo *fpinfo;
-	foreign_loc_cxt inner_cxt;
-	Oid			collation;
-	FDWCollateState state;
+    Oid collation = InvalidOid;
 
 	/* Need do nothing for empty subexpressions */
 	if (node == NULL)
 		return true;
 
-	/* May need server info from baserel's fdw_private struct */
-	fpinfo = FDW_RELINFO(glob_cxt->foreignrel->fdw_private);
-
-	/* Set up inner_cxt for possible recursion to child nodes */
-	inner_cxt.collation = InvalidOid;
-	inner_cxt.state = FDW_COLLATE_NONE;
-
+    if ( expected_collid ) 
+        if ( *expected_collid != DEFAULT_COLLATION_OID && 
+             *expected_collid != InvalidOid )
+            return false;
+    
 	switch (nodeTag(node))
 	{
 		case T_Var:
-			{
-				Var		   *var = (Var *) node;
-
-				/*
-				 * If the Var is from the foreign table, we consider its
-				 * collation (if any) safe to use.  If it is from another
-				 * table, we treat its collation the same way as we would a
-				 * Param's collation, ie it's not safe for it to have a
-				 * non-default collation.
-				 */
-				if (bms_is_member(var->varno, glob_cxt->relids) &&
-					var->varlevelsup == 0)
-				{
-					/* Var belongs to foreign table */
-
-					/*
-					 * System columns other than ctid and oid should not be
-					 * sent to the remote, since we don't make any effort to
-					 * ensure that local and remote values match (tableoid, in
-					 * particular, almost certainly doesn't match).
-					 */
-					if (var->varattno < 0 &&
-						var->varattno != SelfItemPointerAttributeNumber &&
-						var->varattno != ObjectIdAttributeNumber)
-						return false;
-
-					/* Else check the collation
-                     *  We will ensure that the default collation function
-                     *  is shipped over to sqlite, not dealing with any
-                     *  other collation sequence.
-                     *  In principle though we should be able to do a better
-                     *  job as both postgres and sqlite lean on icu
-                     */
-					state = var->varcollid  == DEFAULT_COLLATION_OID 
-                            ? FDW_COLLATE_SAFE : FDW_COLLATE_NONE;
-				}
-				else /* Var belongs to some other table */
-                    state = get_collationState__(var->varcollid);
-			}
+            collation = ((Var *) node)->varcollid;
 			break;
 		case T_Const:
-            state = get_collationState__(((Const *)node)->constcollid);
+            collation = ((Const *) node)->constcollid;
 			break;
 		case T_Param:
-            state = get_collationState__(((Param *)node)->paramcollid);
+            collation = ((Param *) node)->paramcollid;
 			break;
 		case T_OpExpr:
 			{
 				OpExpr	   *oe = (OpExpr *) node;
 
 				/*
-				 * Similarly, only shippable operators can be sent to remote.
-				 * (If the operator is shippable, we assume its underlying
-				 * function is too.)
+				 * Shipping only builtin operators
 				 */
-				if (!is_shippable(oe->opno, OperatorRelationId, fpinfo))
-					return false;
+                if (!is_builtin(oe->opno))
+                    return false;
 
 				/*
 				 * Recurse to input subexpressions.
 				 */
-				if (!foreign_expr_walker((Node *) oe->args,
-										 glob_cxt, &inner_cxt))
-					return false;
+				if (!foreign_expr_walker((Node *) oe->args, NULL,
+										 &oe->inputcollid))
+                    return false;
 
-				/*
-				 * If operator's input collation is not derived from a foreign
-				 * Var, it can't be sent to remote.
-				 */
-				if (oe->inputcollid == InvalidOid)
-					 /* OK, inputs are all noncollatable */ ;
-				else if (inner_cxt.state != FDW_COLLATE_SAFE ||
-						 oe->inputcollid != inner_cxt.collation)
-					return false;
-
-				/* Result-collation handling is same as for functions */
-				collation = oe->opcollid;
-				if (collation == InvalidOid)
-					state = FDW_COLLATE_NONE;
-				else if (inner_cxt.state == FDW_COLLATE_SAFE &&
-						 collation == inner_cxt.collation)
-					state = FDW_COLLATE_SAFE;
-				else if (collation == DEFAULT_COLLATION_OID)
-					state = FDW_COLLATE_NONE;
-				else
-					state = FDW_COLLATE_UNSAFE;
+                collation = oe->opcollid;
 			}
 			break;
 		case T_RelabelType:
-			{
-				RelabelType *r = (RelabelType *) node;
-
-				/*
-				 * Recurse to input subexpression.
-				 */
-				if (!foreign_expr_walker((Node *) r->arg,
-										 glob_cxt, &inner_cxt))
-					return false;
-
-				/*
-				 * RelabelType must not introduce a collation not derived from
-				 * an input foreign Var (same logic as for a real function).
-				 */
-				collation = r->resultcollid;
-				if (collation == InvalidOid)
-					state = FDW_COLLATE_NONE;
-				else if (inner_cxt.state == FDW_COLLATE_SAFE &&
-						 collation == inner_cxt.collation)
-					state = FDW_COLLATE_SAFE;
-				else if (collation == DEFAULT_COLLATION_OID)
-					state = FDW_COLLATE_NONE;
-				else
-					state = FDW_COLLATE_UNSAFE;
-			}
+            return false;
 			break;
 		case T_BoolExpr:
 			{
@@ -323,13 +219,12 @@ foreign_expr_walker(Node *node,
 				/*
 				 * Recurse to input subexpressions.
 				 */
-				if (!foreign_expr_walker((Node *) b->args,
-										 glob_cxt, &inner_cxt))
+				if (!foreign_expr_walker((Node *) b->args, NULL, 
+                                          expected_collid))
 					return false;
 
 				/* Output is always boolean and so noncollatable. */
 				collation = InvalidOid;
-				state = FDW_COLLATE_NONE;
 			}
 			break;
 		case T_NullTest:
@@ -339,49 +234,42 @@ foreign_expr_walker(Node *node,
 				/*
 				 * Recurse to input subexpressions.
 				 */
-				if (!foreign_expr_walker((Node *) nt->arg,
-										 glob_cxt, &inner_cxt))
+				if (!foreign_expr_walker((Node *) nt->arg, NULL, 
+                                          expected_collid))
 					return false;
 
 				/* Output is always boolean and so noncollatable. */
 				collation = InvalidOid;
-				state = FDW_COLLATE_NONE;
 			}
 			break;
 		case T_List:
 			{
 				List	   *l = (List *) node;
 				ListCell   *lc;
+                Oid       *vec = l->length > 0 ?
+                                 palloc0(l->length * sizeof(Oid)) : NULL;
+                int        i = 0;
 
 				/*
 				 * Recurse to component subexpressions.
 				 */
 				foreach(lc, l)
 				{
-					if (!foreign_expr_walker((Node *) lfirst(lc),
-											 glob_cxt, &inner_cxt))
+					if (!foreign_expr_walker((Node *) lfirst(lc), vec + i, 
+                                              expected_collid))
 						return false;
+                    i++;
 				}
-
-				/*
-				 * When processing a list, collation state just bubbles up
-				 * from the list elements.
-				 */
-				collation = inner_cxt.collation;
-				state = inner_cxt.state;
-
-				/* Don't apply exprType() to the list. */
-				check_type = false;
+                for ( i = 0; i < l->length; i++)
+                    if ( vec[i] != vec[0] )
+                        return false;
+                collation = vec ? vec[0] : InvalidOid;
 			}
 			break;
 		case T_Aggref:
 			{
 				Aggref	   *agg = (Aggref *) node;
 				ListCell   *lc;
-
-				/* Not safe to pushdown when not in grouping context */
-				if (!IS_UPPER_REL(glob_cxt->foreignrel))
-					return false;
 
 				/* Only non-split aggregates are pushable. */
 				if (agg->aggsplit != AGGSPLIT_SIMPLE)
@@ -390,6 +278,16 @@ foreign_expr_walker(Node *node,
 				/* As usual, it must be shippable. */
 				if (!is_shippable_agg(agg->aggfnoid))
 					return false;
+				
+                /*
+				 * For aggorder elements, check whether the sort operator, if
+				 * specified, is shippable or not.
+				 */
+				if (agg->aggorder)  // no support in sqlite for aggorder
+                    return false;
+
+                if (agg->aggfilter) // no support in sqlite for aggfilter
+                    return false;
 
 				/*
 				 * Recurse to input args. aggdirectargs, aggorder and
@@ -408,66 +306,36 @@ foreign_expr_walker(Node *node,
 						n = (Node *) tle->expr;
 					}
 
-					if (!foreign_expr_walker(n, glob_cxt, &inner_cxt))
+					if (!foreign_expr_walker(n, NULL, &agg->inputcollid))
 						return false;
 				}
+                collation = agg->aggcollid;
+			}
+			break;
+		case T_FuncExpr:
+            {
+				FuncExpr   *fe = (FuncExpr *) node;
 
 				/*
-				 * For aggorder elements, check whether the sort operator, if
-				 * specified, is shippable or not.
+				 * If function used by the expression is not shippable, it
+				 * can't be sent to remote because it might have incompatible
+				 * semantics on remote side.
 				 */
-				if (agg->aggorder)  // no support in sqlite for aggorder
-                    return false;
-
-                if (agg->aggfilter) // no support in sqlite for aggfilter
-                    return false;
-
-				/*
-				 * If aggregate's input collation is not derived from a
-				 * foreign Var, it can't be sent to remote.
-				 */
-				if (agg->inputcollid == InvalidOid)
-					 /* OK, inputs are all noncollatable */ ;
-				else if (inner_cxt.state != FDW_COLLATE_SAFE ||
-						 agg->inputcollid != inner_cxt.collation)
+				if (!is_shippable_func(fe->funcid))
 					return false;
 
 				/*
-				 * Detect whether node is introducing a collation not derived
-				 * from a foreign Var.  (If so, we just mark it unsafe for now
-				 * rather than immediately returning false, since the parent
-				 * node might not care.)
+				 * Recurse to input subexpressions.
 				 */
-				collation = agg->aggcollid;
-				if (collation == InvalidOid)
-					state = FDW_COLLATE_NONE;
-				else if (inner_cxt.state == FDW_COLLATE_SAFE &&
-						 collation == inner_cxt.collation)
-					state = FDW_COLLATE_SAFE;
-				else if (collation == DEFAULT_COLLATION_OID)
-					state = FDW_COLLATE_NONE;
-				else
-					state = FDW_COLLATE_UNSAFE;
+				if (!foreign_expr_walker((Node *) fe->args, NULL,
+                                         &fe->inputcollid))
+					return false;
+
+                collation = fe->funccollid;
 			}
-			break;
 		case T_DistinctExpr:	/* IS DISTINCT FROM clause, */
 		case T_ScalarArrayOpExpr: // No any/all support in sqlite
 		case T_ArrayExpr:   // No array support in sqlite
-		case T_FuncExpr:
-            /*
-             *  TODO AG
-             *  Now we face a hard challenge, mapping postgres functions
-             *  to sqlite functions. 
-             *  Further challenge, even if there is an obvious candidate
-             *  on the sqlite side (say for example the lower function)
-             *  then the semantics might be different. So we will have to 
-             *  have extensions loaded for sqlite that guarantee the same
-             *  semantics.
-             *  There are some functions like abs that can be shipped,
-             *  but not bothering with the one or two functions that can 
-             *  be safely shipped
-             *  Kicking the can down the road.....
-             */
 		default:
 
 			/*
@@ -477,60 +345,16 @@ foreign_expr_walker(Node *node,
 			return false;
 	}
 
-	/*
-	 * If result type of given expression is not shippable, it can't be sent
-	 * to remote because it might have incompatible semantics on remote side.
-	 */
-	if (check_type && !is_shippable(exprType(node), TypeRelationId, fpinfo))
-		return false;
+    if ( collation != InvalidOid && collation != DEFAULT_COLLATION_OID )
+        return false;
 
-	/*
-	 * Now, merge my collation information into my parent's state.
-	 */
-	if (state > outer_cxt->state)
-	{
-		/* Override previous parent state */
-		outer_cxt->collation = collation;
-		outer_cxt->state = state;
-	}
-	else if (state == outer_cxt->state)
-	{
-		/* Merge, or detect error if there's a collation conflict */
-		switch (state)
-		{
-			case FDW_COLLATE_NONE:
-				/* Nothing + nothing is still nothing */
-				break;
-			case FDW_COLLATE_SAFE:
-				if (collation != outer_cxt->collation)
-				{
-					/*
-					 * Non-default collation always beats default.
-					 */
-					if (outer_cxt->collation == DEFAULT_COLLATION_OID)
-					{
-						/* Override previous parent state */
-						outer_cxt->collation = collation;
-					}
-					else if (collation != DEFAULT_COLLATION_OID)
-					{
-						/*
-						 * Conflict; show state as indeterminate.  We don't
-						 * want to "return false" right away, since parent
-						 * node might not care about collation.
-						 */
-						outer_cxt->state = FDW_COLLATE_UNSAFE;
-					}
-				}
-				break;
-			case FDW_COLLATE_UNSAFE:
-				/* We're still conflicted ... */
-				break;
-		}
-	}
+    if ( expected_collid && collation != *expected_collid )
+        return false;
 
-	/* It looks OK */
-	return true;
+    if ( expr_collid )
+        *expr_collid = collation;
+
+    return true;
 }
 
 /*
@@ -627,7 +451,7 @@ deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
 	deparse_expr_cxt context;
 	SqliteFdwRelationInfo *fpinfo = FDW_RELINFO(rel->fdw_private);
 	List	*quals;
-
+    
 	/*
 	 * We handle relations for foreign tables, joins between those and upper
 	 * relations.
@@ -643,14 +467,17 @@ deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
 
 	/* Construct SELECT clause */
 	deparseSelectSql(tlist, is_subquery, retrieved_attrs, &context);
-
+    
 	/*
 	 * For upper relations, the WHERE clause is built from the remote
 	 * conditions of the underlying scan relation; otherwise, we can use the
 	 * supplied list of remote conditions directly.
 	 */
-	if (IS_UPPER_REL(rel))
-		quals = FDW_RELINFO(fpinfo->grouped_rel->fdw_private)->remote_conds;
+	if (IS_UPPER_REL(rel)) {
+        if (! context.scanrel )
+            elog(ERROR, "internal error needed grouped_rel");
+		quals = FDW_RELINFO(context.scanrel->fdw_private)->remote_conds;
+    }
 	else
 		quals = remote_conds;
 
@@ -674,15 +501,6 @@ deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
 	/* Add ORDER BY clause if we found any useful pathkeys */
 	if (pathkeys)
 		appendOrderByClause(pathkeys, &context);
-
-	/* Add any necessary FOR UPDATE/SHARE. */
-	/* deparseLockingClause(&context); */
-    /*
-     * Sqlite's ACID model implies that updates are serializable see:
-     * https://sqlite.org/lockingv3.html
-     * Hence we will have no need for locking clauses even if/when 
-     * we were to support inserts, updates and deletes
-     */
 }
 
 /*
@@ -705,8 +523,7 @@ deparseSelectSql(List *tlist, bool is_subquery, List **retrieved_attrs,
 	StringInfo	buf = context->buf;
 	RelOptInfo *foreignrel = context->foreignrel;
 	PlannerInfo *root = context->root;
-	SqliteFdwRelationInfo *fpinfo = (SqliteFdwRelationInfo *) 
-                                    foreignrel->fdw_private;
+	SqliteFdwRelationInfo *fpinfo = FDW_RELINFO(foreignrel->fdw_private);
 
 	/*
 	 * Construct SELECT list
@@ -743,7 +560,6 @@ deparseSelectSql(List *tlist, bool is_subquery, List **retrieved_attrs,
 		 * can use NoLock here.
 		 */
 		Relation	rel = heap_open(rte->relid, NoLock);
-
 		deparseTargetList(buf, root, foreignrel->relid, rel, false,
 						  fpinfo->attrs_used, false, retrieved_attrs);
 		heap_close(rel, NoLock);
@@ -1469,7 +1285,7 @@ deparseExpr(Expr *node, deparse_expr_cxt *context)
 {
 	if (node == NULL)
 		return;
-
+    
 	switch (nodeTag(node))
 	{
 		case T_Var:
@@ -1781,7 +1597,7 @@ deparseFuncExpr(FuncExpr *node, deparse_expr_cxt *context)
 	bool		use_variadic;
 	bool		first;
 	ListCell   *arg;
-
+	
 	/*
 	 * If the function call came from an implicit coercion, then just show the
 	 * first argument.

@@ -178,6 +178,9 @@ foreign_expr_walker(Node *node, Oid *expr_collid, Oid *expected_collid)
              *expected_collid != InvalidOid )
             return false;
     
+    elog(SQLITE_FDW_LOG_LEVEL,
+         "in foreign_expr_walker %s", nodeToString(node));
+    
 	switch (nodeTag(node))
 	{
 		case T_Var:
@@ -260,7 +263,7 @@ foreign_expr_walker(Node *node, Oid *expr_collid, Oid *expected_collid)
 						return false;
                     i++;
 				}
-                for ( i = 0; i < l->length; i++)
+                for ( i = 1; i < l->length; i++)
                     if ( vec[i] != vec[0] )
                         return false;
                 collation = vec ? vec[0] : InvalidOid;
@@ -333,15 +336,34 @@ foreign_expr_walker(Node *node, Oid *expr_collid, Oid *expected_collid)
 
                 collation = fe->funccollid;
 			}
-		case T_DistinctExpr:	/* IS DISTINCT FROM clause, */
-		case T_ScalarArrayOpExpr: // No any/all support in sqlite
+		case T_ScalarArrayOpExpr: 
+            {
+                /*
+                 *  When the sql statement is where blah in (...) we get 
+                 *  here as where blah = any(....)
+                 *  We visit this node for blah = all(...), in this case
+                 *  we will let postgres handle the query
+                 */
+				ScalarArrayOpExpr *oe = (ScalarArrayOpExpr *) node;
+                Node *arraynode = (Node *) lsecond(oe->args); 
+                
+                if ( (!oe->useOr) || 
+                     (!arraynode) ||
+                     (!IsA(arraynode, Const)) ||
+                     ( ((Const *)arraynode)->constisnull ) 
+                   )
+                    return false;
+                
+                if (!foreign_expr_walker((Node *) oe->args, NULL,
+                                         &oe->inputcollid))
+					return false;
+                
+                collation = InvalidOid;
+            }
+            break;
+		case T_DistinctExpr:	/* IS DISTINCT FROM, no support in sqlite */
 		case T_ArrayExpr:   // No array support in sqlite
 		default:
-
-			/*
-			 * If it's anything else, assume it's unsafe.  This list can be
-			 * expanded later, but don't forget to add deparse support below.
-			 */
 			return false;
 	}
 
@@ -1399,6 +1421,24 @@ deparseVar(Var *node, deparse_expr_cxt *context)
 	}
 }
 
+
+static bool
+const_is_array(Const * node)
+{
+    Oid typeoid = node->consttype;
+    HeapTuple	 tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typeoid));
+	Form_pg_type typeform;
+    bool         isarray;
+	
+	if (!HeapTupleIsValid(tuple))
+        elog(ERROR, "cache lookup failed for type %u", typeoid);
+	typeform = (Form_pg_type) GETSTRUCT(tuple);
+
+    isarray = typeform->typelem != InvalidOid && typeform->typstorage != 'p';
+    ReleaseSysCache(tuple);
+    return isarray;
+}
+
 /*
  * Deparse given constant value into context->buf.
  *
@@ -1416,6 +1456,10 @@ deparseConst(Const *node, deparse_expr_cxt *context, int showtype)
 	char	   *extval;
 	bool		isfloat = false;
 	bool		needlabel;
+    
+    elog(SQLITE_FDW_LOG_LEVEL,
+         "in deparseConst %s, isarray = %d", 
+         nodeToString(node), const_is_array(node));
 
 	if (node->constisnull)
 	{
@@ -1502,6 +1546,47 @@ deparseConst(Const *node, deparse_expr_cxt *context, int showtype)
 		// 				 deparse_type_name(node->consttype,
 		// 								   node->consttypmod));
 }
+
+
+static void
+deparseConstArray(Const *arraynode, deparse_expr_cxt *context)
+{
+    ArrayType *arrayval = DatumGetArrayTypeP(arraynode->constvalue);
+    int16   elmlen;
+    bool    elmbyval;
+    char    elmalign;
+    int     num_elements, i;
+    Datum   *element_values;
+    bool    *element_null;
+    Const   array_member;
+    bool    isfirst = true;
+
+    
+    get_typlenbyvalalign(
+            ARR_ELEMTYPE(arrayval),                                
+            &elmlen, &elmbyval, &elmalign); 
+    
+    deconstruct_array(arrayval, ARR_ELEMTYPE(arrayval),
+                      elmlen, elmbyval, elmalign,
+                      &element_values, &element_null, &num_elements);
+
+    array_member.xpr.type = T_Const;
+    array_member.consttype = ARR_ELEMTYPE(arrayval);
+    array_member.consttypmod = -1;
+    array_member.constcollid = arraynode->constcollid;
+    array_member.constlen = elmlen;
+    array_member.constbyval = elmbyval;
+
+    for ( i = 0; i < num_elements; i++) {
+        if (!isfirst)
+            appendStringInfoString(context->buf, ",");
+        array_member.constvalue = element_values[i];
+        array_member.constisnull = element_null[i];
+        deparseConst(&array_member, context, -1);
+        isfirst = false;
+    }
+}
+
 
 /*
  * Deparse given Param node.
@@ -1746,6 +1831,7 @@ deparseDistinctExpr(DistinctExpr *node, deparse_expr_cxt *context)
 	appendStringInfoChar(buf, ')');
 }
 
+
 /*
  * Deparse given ScalarArrayOpExpr expression.  To avoid problems
  * around priority of operations, we always parenthesize the arguments.
@@ -1754,16 +1840,16 @@ static void
 deparseScalarArrayOpExpr(ScalarArrayOpExpr *node, deparse_expr_cxt *context)
 {
 	StringInfo	buf = context->buf;
-	HeapTuple	tuple;
-	Form_pg_operator form;
+	// HeapTuple	tuple;
+	// Form_pg_operator form;
 	Expr	   *arg1;
 	Expr	   *arg2;
 
 	/* Retrieve information about the operator from system catalog. */
-	tuple = SearchSysCache1(OPEROID, ObjectIdGetDatum(node->opno));
-	if (!HeapTupleIsValid(tuple))
-		elog(ERROR, "cache lookup failed for operator %u", node->opno);
-	form = (Form_pg_operator) GETSTRUCT(tuple);
+	// tuple = SearchSysCache1(OPEROID, ObjectIdGetDatum(node->opno));
+	// if (!HeapTupleIsValid(tuple))
+		// elog(ERROR, "cache lookup failed for operator %u", node->opno);
+	// form = (Form_pg_operator) GETSTRUCT(tuple);
 
 	/* Sanity check. */
 	Assert(list_length(node->args) == 2);
@@ -1777,19 +1863,19 @@ deparseScalarArrayOpExpr(ScalarArrayOpExpr *node, deparse_expr_cxt *context)
 	appendStringInfoChar(buf, ' ');
 
 	/* Deparse operator name plus decoration. */
-	deparseOperatorName(buf, form);
-	appendStringInfo(buf, " %s (", node->useOr ? "ANY" : "ALL");
+	// deparseOperatorName(buf, form);
+	appendStringInfo(buf, " IN (");
 
 	/* Deparse right operand. */
 	arg2 = lsecond(node->args);
-	deparseExpr(arg2, context);
+	deparseConstArray((Const *)arg2, context);
 
 	appendStringInfoChar(buf, ')');
 
 	/* Always parenthesize the expression. */
 	appendStringInfoChar(buf, ')');
 
-	ReleaseSysCache(tuple);
+	// ReleaseSysCache(tuple);
 }
 
 /*

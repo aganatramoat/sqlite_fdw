@@ -22,6 +22,7 @@
 #include <optimizer/tlist.h>
 #include <optimizer/pathnode.h>
 #include <parser/parse_oper.h>
+#include <parser/parse_type.h>
 #include <executor/executor.h>
 
 #include <sys/stat.h>
@@ -39,6 +40,17 @@ static void add_columnDefinition__(StringInfoData *cftsql, int counter,
                                    sqlite3_stmt *columns);
 
 
+void 
+dispose_sqlite(sqlite3 *db, sqlite3_stmt *stmt)
+{
+    if (stmt)
+        sqlite3_finalize(stmt);
+    if (db)
+        sqlite3_close(db);
+}
+
+
+// this function will be used by sqlite for its default binary collation
 static int
 compare_text(void * tmp, int len1, const void * str1,
              int len2, const void * str2)
@@ -49,20 +61,62 @@ compare_text(void * tmp, int len1, const void * str1,
 }
 
 
-typedef struct PgTypeInputTraits__ 
+// convenience function to make a text datum (which is varlen) from string
+static Datum
+string_to_textDatum__(unsigned char const * str)
 {
-    regproc   typeinput;
-    int       typmod;
-    bool      valid;
-} PgTypeInputTraits__;
+    size_t len = strlen((char *)str);
+    void * blob = palloc0(len + VARHDRSZ);
+    memcpy((char *)blob + VARHDRSZ, str, len);
+    SET_VARSIZE(blob, len + VARHDRSZ);
+    return PointerGetDatum(blob);
+}
 
-static PgTypeInputTraits__ get_pgTypeInputTraits__(Oid pgtyp);
-static Datum make_datumFloat__(sqlite3_stmt *stmt, int col, Oid pgtyp, 
-                               PgTypeInputTraits__ traits);
-static Datum make_datumInt__(sqlite3_stmt *stmt, int col, Oid pgtyp, 
-                             PgTypeInputTraits__ traits);
+
+typedef Datum (*PatternMatchFunc)(FunctionCallInfo);
+
+static void
+invoke_pattern_match__(sqlite3_context *cxt, sqlite3_value **argv, 
+                       PatternMatchFunc pattern_match)
+{
+    const unsigned char *pattern = sqlite3_value_text(argv[0]);
+    const unsigned char *str = sqlite3_value_text(argv[1]);
+    FunctionCallInfoData fcinfo;
+    
+    fcinfo.arg[0] = string_to_textDatum__(str);
+    fcinfo.arg[1] = string_to_textDatum__(pattern);
+    fcinfo.fncollation = DEFAULT_COLLATION_OID;
+    
+    sqlite3_result_int(cxt, DatumGetBool(pattern_match(&fcinfo)));
+    pfree(DatumGetPointer(fcinfo.arg[0]));
+    pfree(DatumGetPointer(fcinfo.arg[1]));
+}
+
+
+// shipped to sqlite to implement like operator
+static void
+invoke_like(sqlite3_context *cxt, int argc, sqlite3_value **argv)
+{
+    invoke_pattern_match__(cxt, argv, textlike);
+}
+
+    
+// shipped to sqlite to implement regexp operator
+static void
+invoke_regexp(sqlite3_context *cxt, int argc, sqlite3_value **argv)
+{
+    invoke_pattern_match__(cxt, argv, textregexeq);
+}
+
+
+
+static PgTypeInputTraits get_pgTypeInputTraits__(Oid pgtyp);
+static Datum make_datumFloat__(sqlite3_stmt *stmt, int col,
+                               PgTypeInputTraits *traits);
+static Datum make_datumInt__(sqlite3_stmt *stmt, int col,
+                             PgTypeInputTraits *traits);
 static Datum make_datumViaCString__(sqlite3_stmt *stmt, int col,
-                                    PgTypeInputTraits__ traits);
+                                    PgTypeInputTraits *traits);
 
 
 
@@ -105,12 +159,19 @@ static Datum make_datumViaCString__(sqlite3_stmt *stmt, int col,
  *   or Blob, then we are good to go. In addition if the 
  *   column type is explicity timestamp, date or boolean then 
  *   again we are good.
- *   Otherwise we croak.
+ *   Finally we will look up the type in postgres's pg_type 
+ *   system table. If it exists we will go ahead and it will be the 
+ *   users responsibility to be sure that the values in the column
+ *   can be translated
+ *   Otherwise we croak
  */
 static char const *
 translate_sqliteType__(char const *type)
 {
     char const * affinity;
+    Oid typoid = InvalidOid;
+    int32 typmod_p = 0;
+    
     type = asc_tolower(type, strlen(type) + 1);
     affinity = get_affinity__(type);
     
@@ -131,6 +192,10 @@ translate_sqliteType__(char const *type)
 
     if ( strncmp(type, "bool", 4) == 0 )
         return "boolean";
+
+    parseTypeString(type, &typoid, &typmod_p, true);
+    if (OidIsValid(typoid))
+        return type;
     
     ereport(ERROR,
         (errcode(ERRCODE_FDW_ERROR),
@@ -170,7 +235,8 @@ get_affinity__(char const *type)
 sqlite3 *
 get_sqliteDbHandle(char const *filename)
 {
-    sqlite3 *db;
+    sqlite3 *db = NULL;
+    int rc = 0;
 	if (sqlite3_open(filename, &db) != SQLITE_OK) 
 		ereport(ERROR,
 			(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
@@ -183,8 +249,49 @@ get_sqliteDbHandle(char const *filename)
      *  Remap the BINARY collation of sqlite3 to use the comparison 
      *  operator provided by postgres (DEFAULT_COLLATION_OID)
      */
-    sqlite3_create_collation_v2(db, "BINARY", SQLITE_UTF8, 
-                                NULL, compare_text, NULL);
+    rc = sqlite3_create_collation_v2(db, "BINARY", SQLITE_UTF8, 
+                                     NULL, compare_text, NULL);
+    if ( rc != SQLITE_OK )
+		ereport(ERROR,
+			(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
+			errmsg("Could not ship collation for %s: %s", 
+                    filename, 
+                    sqlite3_errmsg(db))
+			));
+
+    /*
+     *  Remap the like function to use postgres's implementation
+     */
+    rc = sqlite3_create_function_v2(db, "like", 2, 
+            SQLITE_UTF8 | SQLITE_DETERMINISTIC,
+            NULL,
+            invoke_like,
+            NULL, NULL, NULL);
+    if ( rc != SQLITE_OK )
+		ereport(ERROR,
+			(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
+			errmsg("Could not ship the like function for %s: %s", 
+                    filename, 
+                    sqlite3_errmsg(db))
+			));
+    
+    
+    /*
+     *  Setup sqlite to use postgres's implementation of regexp
+     */
+    rc = sqlite3_create_function_v2(db, "regexp", 2, 
+            SQLITE_UTF8 | SQLITE_DETERMINISTIC,
+            NULL,
+            invoke_regexp,
+            NULL, NULL, NULL);
+    if ( rc != SQLITE_OK )
+		ereport(ERROR,
+			(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
+			errmsg("Could not ship the regexp function for %s: %s", 
+                    filename, 
+                    sqlite3_errmsg(db))
+			));
+    
     return db;
 }
 
@@ -275,14 +382,13 @@ get_foreignTableCreationSql(ImportForeignSchemaStmt *stmt,
         if ( cftsql.data )
             pfree(cftsql.data);
         pfree(columns_q);
-        if ( columns )
-            sqlite3_finalize(columns);
+        dispose_sqlite(NULL, columns);
         PG_RE_THROW();
     }
     PG_END_TRY();
     
-    if ( columns )
-        sqlite3_finalize(columns);
+    dispose_sqlite(NULL, columns);
+    pfree(columns_q);
     
     appendStringInfo(&cftsql, "\n) SERVER %s\n"
             "OPTIONS (table '%s')",
@@ -394,21 +500,20 @@ get_sqliteTableImportOptions(ImportForeignSchemaStmt *stmt)
 
 
 static Datum
-make_datumViaCString__(sqlite3_stmt *stmt, int col, PgTypeInputTraits__ traits)
+make_datumViaCString__(sqlite3_stmt *stmt, int col, PgTypeInputTraits *traits)
 {
     return OidFunctionCall3(
-                traits.typeinput, 
+                traits->typeinput, 
                 CStringGetDatum((char*) sqlite3_column_text(stmt, col)),
                 ObjectIdGetDatum(InvalidOid), 
-                Int32GetDatum(traits.typmod));
+                Int32GetDatum(traits->typmod));
 }
 
 
 static Datum
-make_datumInt__(sqlite3_stmt *stmt, int col, Oid pgtyp, 
-                PgTypeInputTraits__ traits)
+make_datumInt__(sqlite3_stmt *stmt, int col, PgTypeInputTraits *traits)
 {
-    switch ( pgtyp )
+    switch ( traits->pgtyp )
     {
         case BOOLOID:
             return BoolGetDatum(sqlite3_column_int(stmt, col) > 0);
@@ -432,10 +537,10 @@ make_datumInt__(sqlite3_stmt *stmt, int col, Oid pgtyp,
 
 
 static Datum
-make_datumFloat__(sqlite3_stmt *stmt, int col, Oid pgtyp, 
-                  PgTypeInputTraits__ traits)
+make_datumFloat__(sqlite3_stmt *stmt, int col,
+                  PgTypeInputTraits *traits)
 {
-    switch ( pgtyp )
+    switch ( traits->pgtyp )
     {
         case FLOAT4OID:
             return Float4GetDatum((float) sqlite3_column_double(stmt, col));
@@ -449,12 +554,13 @@ make_datumFloat__(sqlite3_stmt *stmt, int col, Oid pgtyp,
 }
 
 
-static PgTypeInputTraits__
+static PgTypeInputTraits
 get_pgTypeInputTraits__(Oid pgtyp)
 {
-    PgTypeInputTraits__ traits;
+    PgTypeInputTraits traits;
 	HeapTuple tuple;
 	
+    traits.pgtyp = pgtyp;
     tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(pgtyp));
 	if (!HeapTupleIsValid(tuple))
     {
@@ -474,19 +580,18 @@ get_pgTypeInputTraits__(Oid pgtyp)
 
 
 Datum
-make_datum(sqlite3_stmt *stmt, int col, Oid pgtyp, bool *isnull)
+make_datum(sqlite3_stmt *stmt, int col, PgTypeInputTraits *traits, bool *isnull)
 {
-    PgTypeInputTraits__ traits = get_pgTypeInputTraits__(pgtyp);
-    if (!traits.valid)
+    if (!traits->valid)
         return (Datum) 0;
 	
     *isnull = false;
     switch ( sqlite3_column_type(stmt, col) )
     {
         case SQLITE_INTEGER:
-            return make_datumInt__(stmt, col, pgtyp, traits);
+            return make_datumInt__(stmt, col, traits);
         case SQLITE_FLOAT:
-            return make_datumFloat__(stmt, col, pgtyp, traits);
+            return make_datumFloat__(stmt, col, traits);
         case SQLITE_TEXT:
             return make_datumViaCString__(stmt, col, traits);
         case SQLITE_BLOB:
@@ -1090,14 +1195,9 @@ sqlite_bind_param_values(ForeignScanState *node)
 void
 cleanup_(SqliteFdwExecutionState *festate)
 {
-    if ( festate->stmt ) {
-        sqlite3_finalize(festate->stmt);
-        festate->stmt = NULL;
-    }
-    if ( festate->db ) {
-        sqlite3_close(festate->db);
-        festate->db = NULL;
-    }
+    dispose_sqlite(festate->db, festate->stmt);
+    festate->db = NULL;
+    festate->stmt = NULL;
 }
 
 
@@ -1293,4 +1393,147 @@ find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel)
 
 	/* We didn't find any suitable equivalence class expression */
 	return NULL;
+}
+
+
+int 
+get_rowCount(char const *database, char const *table)
+{
+    sqlite3 *db = get_sqliteDbHandle(database);
+    char *query = palloc0(strlen(table) + 32);
+    sqlite3_stmt *volatile stmt;
+    int rowcount = 0;
+
+    sprintf(query, "select count(*) from %s", quote_identifier(table));
+    PG_TRY();
+    {
+        stmt = prepare_sqliteQuery(db, query, NULL);
+        if (sqlite3_step(stmt) == SQLITE_OK)
+            rowcount = sqlite3_column_int(stmt, 0);
+    }
+    PG_CATCH();
+    {
+        dispose_sqlite(db, stmt);
+        pfree(query);
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+
+    dispose_sqlite(db, stmt);
+    pfree(query);
+    
+    return rowcount;
+}
+
+
+/* 
+ * Guess the size of a row
+ * Caveats:
+ *    1. If an attribute is variable sized then put in a default number
+ *    2. Sqlite might have stored a value with a smaller footprint than 
+ *       what we think.
+ *  In other words, we can be pretty wildly off, which can throw off
+ *  the costing. Hopefully not by much as only the page costs will be off.
+ */
+int
+get_rowSize(Relation relation)
+{
+    TupleDesc rd_att = relation->rd_att;
+    Form_pg_attribute *attrs = rd_att->attrs;
+    int i = 0;
+    int rowsize = 0;
+
+    // if attlen < 0 then it is a varlen attr
+    for ( i = 0; i < rd_att->natts; i++ ) {
+        FormData_pg_attribute *attr = attrs[i];
+        rowsize += attr->attlen > 0 ? attr->attlen : DEFAULT_ATTR_LEN;
+    }
+    
+    return rowsize;
+}
+
+
+int
+get_numPages(Relation relation)
+{
+    Oid  relid = RelationGetRelid(relation);
+    HeapTuple ctup = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+    Form_pg_class pgcform;
+    int numpages = 0;
+    
+    if (!HeapTupleIsValid(ctup))
+        elog(ERROR, "pg_class entry for relid %u vanished during vacuuming",
+                   relid);
+    pgcform = (Form_pg_class) GETSTRUCT(ctup);
+    numpages = pgcform->relpages;
+    ReleaseSysCache(ctup);
+
+    return numpages;
+}
+
+
+static void
+collect_foreignSample__(SqliteAnalyzeState *state, sqlite3_stmt *stmt)
+{
+}
+
+
+void
+collect_foreignSamples(SqliteAnalyzeState *state, StringInfoData sql)
+{
+    sqlite3 *db = get_sqliteDbHandle(state->src.database);
+    sqlite3_stmt *volatile stmt = NULL;
+    
+    PG_TRY();
+    {
+        stmt = prepare_sqliteQuery(db, sql.data, NULL);
+        while ( sqlite3_step(stmt) == SQLITE_ROW ) {
+            if (state->count % state->toskip == 0)
+                if (state->numsamples < state->targrows)
+                    collect_foreignSample__(state, stmt);
+            state->count++;
+        }
+    }
+    PG_CATCH();
+    {
+        dispose_sqlite(db, stmt);
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+    dispose_sqlite(db, stmt);
+}
+
+
+void
+populate_tupleTableSlot(sqlite3_stmt *stmt, 
+                        TupleTableSlot *slot,
+                        List *retrieved_attrs,
+                        PgTypeInputTraits *traits)
+{
+    ListCell *lc;
+    int retrieve_col = 0;
+    int natts = slot->tts_tupleDescriptor->natts;
+
+    memset (slot->tts_values, 0, sizeof(Datum) * natts);
+    memset (slot->tts_isnull, true, sizeof(bool) * natts);
+    foreach(lc, retrieved_attrs)
+    {
+        int target = lfirst_int(lc) - 1;
+        slot->tts_values[target] = 
+            make_datum(stmt, retrieve_col, 
+                       traits + target, slot->tts_isnull + target);
+        retrieve_col++;
+    }
+    ExecStoreVirtualTuple(slot);
+}
+
+
+PgTypeInputTraits *
+get_pgTypeInputTraits(TupleDesc desc)
+{
+    PgTypeInputTraits *vec = palloc0(desc->natts * sizeof(PgTypeInputTraits));
+    int i;
+    for ( i = 0; i < desc->natts; i++)
+        vec[i] = get_pgTypeInputTraits__(desc->attrs[i]->atttypid);
+    return vec;
 }

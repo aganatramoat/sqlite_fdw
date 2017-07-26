@@ -5,6 +5,7 @@
 #define SQLITE_FDW_LOG_LEVEL WARNING
 #define DEFAULT_FDW_SORT_MULTIPLIER 1.2
 #define DEFAULT_FDW_STARTUP_COST 100.0
+#define DEFAULT_ATTR_LEN 8
 
 typedef struct 
 {
@@ -106,6 +107,28 @@ typedef struct
 } SqliteFdwRelationInfo;
 
 
+typedef struct
+{
+    Relation    relation;
+    List        *retrieved_attrs;
+    HeapTuple   *rows;    // space to store the sampled rows
+    int8        toskip;   // skip these many before storing a row
+    int8        targrows; // number of rows we want to collect
+    int8        numsamples; // how many rows did we actually collect
+    SqliteTableSource src;
+    int8        count;
+} SqliteAnalyzeState;
+
+
+typedef struct
+{
+    regproc   typeinput;
+    int       typmod;
+    bool      valid;
+    Oid       pgtyp;
+} PgTypeInputTraits;
+
+
 /* Callback argument for ec_member_matches_foreign */
 typedef struct
 {
@@ -122,6 +145,7 @@ typedef struct
 	List   *retrieved_attrs;   /* list of target attribute numbers */
     List   *param_exprs;
     bool   params_bound;
+    PgTypeInputTraits *traits;
 } SqliteFdwExecutionState;
 
 
@@ -177,6 +201,7 @@ void deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
 						bool is_subquery, List **retrieved_attrs,
 						List **params_list);
 bool foreign_expr_walker(Node *node, Oid *expr_collid, Oid *expected_collid);
+StringInfoData construct_foreignSamplesQuery(SqliteAnalyzeState *);
 
 
 // from funcs.c
@@ -195,7 +220,8 @@ bool is_foreign_expr(PlannerInfo *root, RelOptInfo *baserel, Expr *expr);
 void classifyConditions(PlannerInfo *root, RelOptInfo *baserel,
 				        List *input_conds,
 				        List **remote_conds, List **local_conds);
-Datum make_datum(struct sqlite3_stmt *stmt, int col, Oid pgtyp, bool *isnull);
+Datum make_datum(struct sqlite3_stmt *stmt, int col, PgTypeInputTraits *,
+                 bool *isnull);
 struct sqlite3 * get_sqliteDbHandle(char const *filename);
 bool is_sqliteTableRequired(ImportForeignSchemaStmt *stmt, 
                             char const * tablename);
@@ -218,6 +244,15 @@ bool ec_member_matches_foreign(PlannerInfo *root, RelOptInfo *rel,
 int set_transmission_modes(void);
 Expr * find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel);
 void reset_transmission_modes(int nestlevel);
+int get_rowSize(Relation relation);
+int get_numPages(Relation relation);
+int get_rowCount(char const *database, char const *table);
+void collect_foreignSamples(SqliteAnalyzeState *, StringInfoData sql);
+void populate_tupleTableSlot(sqlite3_stmt *stmt, TupleTableSlot *slot,
+                             List *retrieved_attrs,
+                             PgTypeInputTraits *traits);
+void dispose_sqlite(sqlite3 *db, sqlite3_stmt *stmt);
+PgTypeInputTraits *get_pgTypeInputTraits(TupleDesc desc);
 
 #define FDW_RELINFO(X)  ((SqliteFdwRelationInfo *)X)
 

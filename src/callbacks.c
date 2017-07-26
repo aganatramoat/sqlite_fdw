@@ -26,6 +26,9 @@
 #include "callbacks.h"
 
 
+static int8 ESTIMATED_NUM_PAGES = 0;
+
+
 void
 get_foreignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid)
 {
@@ -646,7 +649,6 @@ begin_foreignScan(ForeignScanState *node, int eflags)
     PG_TRY();
     {
         festate->stmt = prepare_sqliteQuery(festate->db, festate->query, NULL);
-        // sqlite_bind_param_values(festate, fsplan->fdw_exprs, node);
     }
     PG_CATCH();
     {
@@ -698,7 +700,7 @@ import_foreignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 			errmsg("Need database option for server %s", 
                     stmt->server_name)
 			));
-
+    
 	/* Connect to the server */
 	db = get_sqliteDbHandle(filename);
 
@@ -707,7 +709,7 @@ import_foreignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 		/* You want all tables, except system tables */
         char tablenames_q[256] = "select name from sqlite_master "
                                   "where type = 'table' "
-                                  "and name not like 'sqlite_%%'";
+                                  "and name not like 'sqlite_%'";
 		
         /* Iterate to all matching tables, and get their definition */
 		tbls = prepare_sqliteQuery(db, tablenames_q, NULL);
@@ -715,23 +717,19 @@ import_foreignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 		{
             char *tablename = (char *) sqlite3_column_text(tbls, 0);
             char *cftsql = get_foreignTableCreationSql(
-                    stmt, db, tablename, importOptions);
+                            stmt, db, tablename, importOptions);
             if ( cftsql )
                 commands = lappend(commands, cftsql);
 		}
 	}
 	PG_CATCH();
 	{
-		if (tbls)
-			sqlite3_finalize(tbls);
-        sqlite3_close(db);
+        dispose_sqlite(db, tbls);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-
-	sqlite3_finalize(tbls);
-	sqlite3_close(db);
-
+    
+    dispose_sqlite(db, tbls);
 	return commands;
 }
 
@@ -749,7 +747,7 @@ explain_foreignScan(ForeignScanState *node, ExplainState *es)
 	 * If the ExplainForeignScan pointer is set to NULL, no additional
 	 * information is printed during EXPLAIN.
 	 */
-	sqlite3_stmt			   *stmt;
+	sqlite3_stmt			   *volatile stmt = NULL;
 	char					   *query;
 	size_t						len;
 	const char				   *pzTail;
@@ -758,25 +756,68 @@ explain_foreignScan(ForeignScanState *node, ExplainState *es)
 
 	/* Show the query (only if VERBOSE) */
 	if (es->verbose)
-	{
 		/* show query */
 		ExplainPropertyText("sqlite query", festate->query, es);
-	}
 
 	/* Build the query */
-	len = strlen(festate->query) + 20;
+	len = strlen(festate->query) + 32;
 	query = (char *)palloc(len);
 	snprintf(query, len, "EXPLAIN QUERY PLAN %s", festate->query);
 
     /* Execute the query */
-	stmt= prepare_sqliteQuery(festate->db, query, &pzTail);
+    PG_TRY();
+    {
+	    stmt = prepare_sqliteQuery(festate->db, query, &pzTail);
+        while (sqlite3_step(stmt) == SQLITE_ROW)
+            ExplainPropertyText(
+                    "sqlite plan", 
+                    (char*)sqlite3_column_text(stmt, 3), 
+                    es);
+    }
+    PG_CATCH();
+    {
+        dispose_sqlite(NULL, stmt);
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
 
-	/* get the next record, if any, and fill in the slot */
-	while (sqlite3_step(stmt) == SQLITE_ROW)
-        ExplainPropertyText("sqlite plan", (char*)sqlite3_column_text(stmt, 3), es);
+    dispose_sqlite(NULL, stmt);
+}
 
-	/* Free the query stmts */
-	sqlite3_finalize(stmt);
+
+static int
+acquire_foreignSamples(Relation relation, int elevel,
+                       HeapTuple *rows, int targrows,
+                       double *totalrows,
+	                   double *totaldeadrows)
+{
+    SqliteAnalyzeState   state = {0};
+	StringInfoData sql;
+	ForeignTable *table = GetForeignTable(RelationGetRelid(relation));
+    
+    state.relation = relation;
+    state.rows = rows;
+    state.targrows = targrows;
+    state.src = get_tableSource(table->relid);
+    
+    *totalrows = (ESTIMATED_NUM_PAGES * BLCKSZ) / get_rowSize(relation);
+    if (targrows > 0)
+        state.toskip = ((int8) *totalrows) / targrows - 1;
+    else
+        state.toskip = (int8) *totalrows;
+    if (state.toskip <= 0)
+        state.toskip = 1;
+
+    sql = construct_foreignSamplesQuery(&state);
+    collect_foreignSamples(&state, sql);
+    
+    *totalrows = state.count;
+    *totaldeadrows = 0;
+	ereport(elevel,
+			(errmsg("\"%s\": table contains %.0f rows, %d rows in sample",
+					RelationGetRelationName(relation),
+					*totalrows, state.numsamples)));
+    return state.numsamples;
 }
 
 
@@ -810,9 +851,18 @@ analyze_foreignTable(Relation relation, AcquireSampleRowsFunc *func,
 	 * the FDW does not have any concept of dead rows.)
 	 * ----
 	 */
+	ForeignTable *table = GetForeignTable(RelationGetRelid(relation));
+    SqliteTableSource src = get_tableSource(table->relid);
+    double rowsize = get_rowSize(relation);
+    double count = get_rowCount(src.database, src.table);
 
-	return false;
+    ESTIMATED_NUM_PAGES = *totalpages = (BlockNumber) ((rowsize * count) / 
+                                                       BLCKSZ);
+    *func = acquire_foreignSamples;
+	
+    return true;
 }
+
 
 TupleTableSlot *
 iterate_foreignScan(ForeignScanState *node)
@@ -842,35 +892,18 @@ iterate_foreignScan(ForeignScanState *node)
 	 */
 	SqliteFdwExecutionState   *festate = (SqliteFdwExecutionState *) 
                                           node->fdw_state;
-	TupleTableSlot  *tupleSlot = node->ss.ss_ScanTupleSlot;
-	TupleDesc       tupleDescriptor = tupleSlot->tts_tupleDescriptor;
-	int             attid = 0;
-	ListCell        *lc = NULL;
-	int             rc = 0;
+	TupleTableSlot  *slot = node->ss.ss_ScanTupleSlot;
 
     if ( ! festate->params_bound )
         sqlite_bind_param_values(node);
-
-	memset (tupleSlot->tts_values, 0, sizeof(Datum) * tupleDescriptor->natts);
-	memset (tupleSlot->tts_isnull, true, sizeof(bool) * tupleDescriptor->natts);
-	attid = 0;
-	ExecClearTuple(tupleSlot);
-    
-    rc = sqlite3_step(festate->stmt);
-	if (rc == SQLITE_ROW)
-	{
-		foreach(lc, festate->retrieved_attrs)
-		{
-			int attnum = lfirst_int(lc) - 1;
-			Oid pgtype = tupleDescriptor->attrs[attnum]->atttypid;
-            tupleSlot->tts_values[attnum] = 
-                    make_datum(festate->stmt, attid, pgtype, 
-                               tupleSlot->tts_isnull + attnum);
-			attid++;
-		}
-		ExecStoreVirtualTuple(tupleSlot);
-	}
-    return tupleSlot;
+    if ( ! festate->traits )
+        festate->traits = get_pgTypeInputTraits(slot->tts_tupleDescriptor);
+	
+    ExecClearTuple(slot);
+    if (sqlite3_step(festate->stmt) == SQLITE_ROW)
+        populate_tupleTableSlot(festate->stmt, slot,
+                                festate->retrieved_attrs, festate->traits);
+    return slot;
 }
 
     

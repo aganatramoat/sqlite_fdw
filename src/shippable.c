@@ -269,3 +269,12 @@ is_shippable_func(Oid funcid)
     return is_allowed_name(funcid, allowed_names, 
                            sizeof(allowed_names) / sizeof(allowed_names[0]));
 }
+
+    
+bool
+is_shippable_op(Oid funcid)
+{
+    char const *allowed_names[] = {"avg", "average", "max", "min", "sum"};
+    return is_allowed_name(funcid, allowed_names, 
+                           sizeof(allowed_names) / sizeof(allowed_names[0]));
+}

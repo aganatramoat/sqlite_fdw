@@ -202,6 +202,16 @@ foreign_expr_walker(Node *node, Oid *expr_collid, Oid *expected_collid)
                 if (!is_builtin(oe->opno))
                     return false;
 
+                /*
+                 * the semantics of like in sqlite are different than
+                 * postgres.  So we will ship over the textlike function
+                 * to sqlite. 
+                 * Also sqlite does not have an ilike operator
+                 */
+                if (oe->opno >= OID_NAME_ICLIKE_OP &&
+                    oe->opno <= OID_BPCHAR_ICLIKE_OP)
+                    return false;
+
 				/*
 				 * Recurse to input subexpressions.
 				 */
@@ -222,8 +232,7 @@ foreign_expr_walker(Node *node, Oid *expr_collid, Oid *expected_collid)
 				/*
 				 * Recurse to input subexpressions.
 				 */
-				if (!foreign_expr_walker((Node *) b->args, NULL, 
-                                          expected_collid))
+				if (!foreign_expr_walker((Node *) b->args, NULL, NULL))
 					return false;
 
 				/* Output is always boolean and so noncollatable. */
@@ -237,8 +246,7 @@ foreign_expr_walker(Node *node, Oid *expr_collid, Oid *expected_collid)
 				/*
 				 * Recurse to input subexpressions.
 				 */
-				if (!foreign_expr_walker((Node *) nt->arg, NULL, 
-                                          expected_collid))
+				if (!foreign_expr_walker((Node *) nt->arg, NULL, NULL))
 					return false;
 
 				/* Output is always boolean and so noncollatable. */
@@ -1231,7 +1239,6 @@ static void
 deparseRelation(StringInfo buf, Relation rel)
 {
 	ForeignTable *table;
-	const char *nspname = NULL;
 	const char *relname = NULL;
 	ListCell   *lc;
 
@@ -1244,24 +1251,14 @@ deparseRelation(StringInfo buf, Relation rel)
 	foreach(lc, table->options)
 	{
 		DefElem    *def = (DefElem *) lfirst(lc);
-
-		if (strcmp(def->defname, "schema_name") == 0)
-			nspname = defGetString(def);
-		else if (strcmp(def->defname, "table_name") == 0)
+		if (strcmp(def->defname, "table_name") == 0)
 			relname = defGetString(def);
 	}
 
-	/*
-	 * Note: we could skip printing the schema name if it's pg_catalog, but
-	 * that doesn't seem worth the trouble.
-	 */
-	if (nspname == NULL)
-		nspname = get_namespace_name(RelationGetNamespace(rel));
 	if (relname == NULL)
 		relname = RelationGetRelationName(rel);
 
-	appendStringInfo(buf, "%s.%s",
-					 quote_identifier(nspname), quote_identifier(relname));
+	appendStringInfo(buf, "%s", quote_identifier(relname));
 }
 
 /*
@@ -1278,8 +1275,8 @@ deparseStringLiteral(StringInfo buf, const char *val)
 	 * backslashes.  This will fail on remote servers before 8.1, but those
 	 * are long out of support.
 	 */
-	if (strchr(val, '\\') != NULL)
-		appendStringInfoChar(buf, ESCAPE_STRING_SYNTAX);
+	// if (strchr(val, '\\') != NULL)
+	// 	appendStringInfoChar(buf, ESCAPE_STRING_SYNTAX);
 	appendStringInfoChar(buf, '\'');
 	for (valptr = val; *valptr; valptr++)
 	{
@@ -1500,7 +1497,7 @@ deparseConst(Const *node, deparse_expr_cxt *context, int showtype)
 			break;
 		case BITOID:
 		case VARBITOID:
-			appendStringInfo(buf, "B'%s'", extval);
+			appendStringInfo(buf, "x'%s'", extval);
 			break;
 		case BOOLOID: // booleans should be ints for sqlite
 			if (strcmp(extval, "t") == 0)
@@ -1786,6 +1783,22 @@ deparseOpExpr(OpExpr *node, deparse_expr_cxt *context)
 	ReleaseSysCache(tuple);
 }
 
+
+static char const *
+translate_opname__(char *opname)
+{
+    if (strcmp(opname, "~~") == 0)
+        return "like";
+    else if (strcmp(opname, "!~~") == 0)
+        return "not like";
+    if (strcmp(opname, "~") == 0)
+        return "regexp";
+    else if (strcmp(opname, "!~") == 0)
+        return "not regexp";
+    else
+        return opname;
+}
+
 /*
  * Print the name of an operator.
  */
@@ -1810,7 +1823,7 @@ deparseOperatorName(StringInfo buf, Form_pg_operator opform)
 	else
 	{
 		/* Just print operator name. */
-		appendStringInfoString(buf, opname);
+		appendStringInfoString(buf, translate_opname__(opname));
 	}
 }
 

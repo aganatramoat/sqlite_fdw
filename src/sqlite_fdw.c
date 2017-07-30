@@ -96,8 +96,6 @@ sqlite_fdw_validator(PG_FUNCTION_ARGS)
 	char      *svr_table = NULL;
 	ListCell  *cell;
 
-	// elog(SQLITE_FDW_LOG_LEVEL, "entering function %s", __func__);
-
 	/*
 	 * Check that only options supported by sqlite_fdw,
 	 * and allowed for the current object type, are given.

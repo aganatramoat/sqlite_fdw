@@ -178,9 +178,6 @@ foreign_expr_walker(Node *node, Oid *expr_collid, Oid *expected_collid)
              *expected_collid != InvalidOid )
             return false;
     
-    elog(SQLITE_FDW_LOG_LEVEL,
-         "in foreign_expr_walker %s", nodeToString(node));
-    
 	switch (nodeTag(node))
 	{
 		case T_Var:
@@ -1454,10 +1451,6 @@ deparseConst(Const *node, deparse_expr_cxt *context, int showtype)
 	bool		isfloat = false;
 	bool		needlabel;
     
-    elog(SQLITE_FDW_LOG_LEVEL,
-         "in deparseConst %s, isarray = %d", 
-         nodeToString(node), const_is_array(node));
-
 	if (node->constisnull)
 	{
 		appendStringInfoString(buf, "NULL");
@@ -2476,6 +2469,9 @@ construct_foreignSamplesQuery(SqliteAnalyzeState *state)
         state->retrieved_attrs = lappend_int(
                 state->retrieved_attrs, i + 1);
     }
+	
+    appendStringInfoString(&sql, " from ");
+    deparseRelation(&sql, state->relation);
     
     return sql;
 }

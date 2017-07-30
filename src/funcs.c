@@ -866,13 +866,8 @@ is_foreign_expr(PlannerInfo *root, RelOptInfo *baserel, Expr *expr)
 {
 	Oid collation = InvalidOid;
 
-	if (!foreign_expr_walker((Node *) expr, &collation, NULL)) {
-        // elog(SQLITE_FDW_LOG_LEVEL,
-        //         "foreign_expr_walker A for %s, %d",
-        //         FDW_RELINFO(baserel->fdw_private)->relation_name->data, 
-        //         collation);
+	if (!foreign_expr_walker((Node *) expr, &collation, NULL))
 		return false;
-    }
     
 	/*
 	 * An expression which includes any mutable functions can't be sent over

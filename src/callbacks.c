@@ -445,15 +445,6 @@ get_foreignPlanJoinUpper__(PlannerInfo *root,
         }
     }
     
-    // elog(SQLITE_FDW_LOG_LEVEL,
-    //      "before deparse costs for grouping %f, %f, pointers are %p, %p, pid is %d", 
-    //      fpinfo->costsize.startup_cost, 
-    //      fpinfo->costsize.total_cost,
-    //      (void *) fpinfo,
-    //      (void *) (fpinfo->grouped_rel),
-    //      getpid());
-    //  raise(SIGSTOP);
-	
     initStringInfo(&sql);
 	deparseSelectStmtForRel(&sql, root, foreignrel, fdw_scan_tlist,
 							remote_exprs, best_path->path.pathkeys,
@@ -868,7 +859,7 @@ analyze_foreignTable(Relation relation, AcquireSampleRowsFunc *func,
 
     *totalpages = (BlockNumber) ((rowsize * SQLITE_ANALYZE_NUM_ROWS) / BLCKSZ);
     *func = acquire_foreignSamples;
-	
+    
     return true;
 }
 
@@ -1181,15 +1172,6 @@ add_foreign_grouping_paths(PlannerInfo *root, RelOptInfo *input_rel,
 	/* Estimate the cost of push down */
 	estimate_path_cost_size(root, grouping_rel);
     
-    // elog(SQLITE_FDW_LOG_LEVEL,
-    //      "costs for grouping %f, %f, pointers are %p, %p, pid is %d", 
-    //      fpinfo->costsize.startup_cost, 
-    //      fpinfo->costsize.total_cost,
-    //      (void *) fpinfo,
-    //      (void *) (fpinfo->grouped_rel),
-    //      getpid());
-    // raise(SIGSTOP);
-
 	/* Create and add foreign path to the grouping relation. */
 	grouppath = create_foreignscan_path(root,
 										grouping_rel,

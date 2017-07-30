@@ -648,6 +648,8 @@ begin_foreignScan(ForeignScanState *node, int eflags)
     festate->retrieved_attrs = list_nth(fsplan->fdw_private, 1);
     festate->param_exprs = ExecInitExprList(fsplan->fdw_exprs, 
                                             (PlanState *)node);
+    festate->traits = get_pgTypeInputTraits(
+            node->ss.ss_currentRelation->rd_att);
     
     PG_TRY();
     {
@@ -903,8 +905,6 @@ iterate_foreignScan(ForeignScanState *node)
 
     if ( ! festate->params_bound )
         sqlite_bind_param_values(node);
-    if ( ! festate->traits )
-        festate->traits = get_pgTypeInputTraits(slot->tts_tupleDescriptor);
 	
     ExecClearTuple(slot);
     if (sqlite3_step(festate->stmt) == SQLITE_ROW)

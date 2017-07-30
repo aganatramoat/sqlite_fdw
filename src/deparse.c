@@ -2284,7 +2284,8 @@ appendFunctionName(Oid funcid, deparse_expr_cxt *context)
 
 	proctup = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcid));
 	if (!HeapTupleIsValid(proctup))
-		elog(ERROR, "cache lookup failed for function %u", funcid);
+		elog(ERROR, "cache lookup failed for function %u from %s", 
+                funcid, __func__);
 	procform = (Form_pg_proc) GETSTRUCT(proctup);
 
 	/* Print schema name only if it's not pg_catalog */

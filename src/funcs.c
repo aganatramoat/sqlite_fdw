@@ -867,10 +867,10 @@ is_foreign_expr(PlannerInfo *root, RelOptInfo *baserel, Expr *expr)
 	Oid collation = InvalidOid;
 
 	if (!foreign_expr_walker((Node *) expr, &collation, NULL)) {
-        elog(SQLITE_FDW_LOG_LEVEL,
-                "foreign_expr_walker A for %s, %d",
-                FDW_RELINFO(baserel->fdw_private)->relation_name->data, 
-                collation);
+        // elog(SQLITE_FDW_LOG_LEVEL,
+        //         "foreign_expr_walker A for %s, %d",
+        //         FDW_RELINFO(baserel->fdw_private)->relation_name->data, 
+        //         collation);
 		return false;
     }
     
@@ -1111,13 +1111,6 @@ estimate_path_cost_size(PlannerInfo *root, RelOptInfo *foreignrel)
     
     store->total_cost = store->startup_cost + store->run_cost +
                         cpu_tuple_cost * retrieved_rows;
-    
-    elog(SQLITE_FDW_LOG_LEVEL,
-        "Various costs for %s, %f, %f, %f", 
-            fpinfo->relation_name->data,
-            store->rows,
-            store->startup_cost,
-            store->total_cost);
 }
 
     
@@ -1172,8 +1165,8 @@ void
 cleanup_(SqliteFdwExecutionState *festate)
 {
     dispose_sqlite(&festate->db, &festate->stmt);
-    // pfree(festate->traits);
-    // festate->traits = NULL;
+    pfree(festate->traits);
+    festate->traits = NULL;
 }
 
 
@@ -1529,7 +1522,7 @@ get_pgTypeInputTraits__(Oid pgtyp)
     tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(pgtyp));
 	if (!HeapTupleIsValid(tuple))
     {
-		elog(ERROR, "cache lookup failed for type%u", pgtyp);
+		elog(ERROR, "cache lookup failed for type %u", pgtyp);
         traits.valid = false;
     }
     else

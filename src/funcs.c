@@ -41,12 +41,16 @@ static void add_columnDefinition__(StringInfoData *cftsql, int counter,
 
 
 void 
-dispose_sqlite(sqlite3 *db, sqlite3_stmt *stmt)
+dispose_sqlite(sqlite3 **db, sqlite3_stmt **stmt)
 {
-    if (stmt)
-        sqlite3_finalize(stmt);
-    if (db)
-        sqlite3_close(db);
+    if (stmt && *stmt) {
+        sqlite3_finalize(*stmt);
+        *stmt = NULL;
+    }
+    if (db && *db) {
+        sqlite3_close(*db);
+        *db = NULL;
+    }
 }
 
 
@@ -110,7 +114,6 @@ invoke_regexp(sqlite3_context *cxt, int argc, sqlite3_value **argv)
 
 
 
-static PgTypeInputTraits get_pgTypeInputTraits__(Oid pgtyp);
 static Datum make_datumFloat__(sqlite3_stmt *stmt, int col,
                                PgTypeInputTraits *traits);
 static Datum make_datumInt__(sqlite3_stmt *stmt, int col,
@@ -239,7 +242,7 @@ get_sqliteDbHandle(char const *filename)
     int rc = 0;
 	if (sqlite3_open(filename, &db) != SQLITE_OK) 
 		ereport(ERROR,
-			(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
+			(errcode(ERRCODE_FDW_ERROR),
 			errmsg("Can't open sqlite database %s: %s", 
                     filename, 
                     sqlite3_errmsg(db))
@@ -253,7 +256,7 @@ get_sqliteDbHandle(char const *filename)
                                      NULL, compare_text, NULL);
     if ( rc != SQLITE_OK )
 		ereport(ERROR,
-			(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
+			(errcode(ERRCODE_FDW_ERROR),
 			errmsg("Could not ship collation for %s: %s", 
                     filename, 
                     sqlite3_errmsg(db))
@@ -269,7 +272,7 @@ get_sqliteDbHandle(char const *filename)
             NULL, NULL, NULL);
     if ( rc != SQLITE_OK )
 		ereport(ERROR,
-			(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
+			(errcode(ERRCODE_FDW_ERROR),
 			errmsg("Could not ship the like function for %s: %s", 
                     filename, 
                     sqlite3_errmsg(db))
@@ -301,17 +304,13 @@ prepare_sqliteQuery(sqlite3 *db, char *query, const char **pzTail)
 {
     sqlite3_stmt *stmt;
     
-	/* Execute the query */
 	if ( sqlite3_prepare_v2(db, query, -1, &stmt, pzTail) != 
             SQLITE_OK )
-	{
-		sqlite3_close(db);
 		ereport(ERROR,
 			(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
 			errmsg("SQL error during prepare: %s\n query was: %s", 
                     sqlite3_errmsg(db), query)
 			));
-	}
     return stmt;
 }
 
@@ -382,12 +381,12 @@ get_foreignTableCreationSql(ImportForeignSchemaStmt *stmt,
         if ( cftsql.data )
             pfree(cftsql.data);
         pfree(columns_q);
-        dispose_sqlite(NULL, columns);
+        dispose_sqlite(NULL, (sqlite3_stmt **)&columns);
         PG_RE_THROW();
     }
     PG_END_TRY();
     
-    dispose_sqlite(NULL, columns);
+    dispose_sqlite(NULL, (sqlite3_stmt **)&columns);
     pfree(columns_q);
     
     appendStringInfo(&cftsql, "\n) SERVER %s\n"
@@ -519,7 +518,7 @@ make_datumInt__(sqlite3_stmt *stmt, int col, PgTypeInputTraits *traits)
             return BoolGetDatum(sqlite3_column_int(stmt, col) > 0);
         
         case INT8OID:
-            return Int64GetDatum(sqlite3_column_int(stmt, col));
+            return Int64GetDatum(sqlite3_column_int64(stmt, col));
 
         case INT4OID:
             return Int32GetDatum(sqlite3_column_int(stmt, col));
@@ -554,29 +553,6 @@ make_datumFloat__(sqlite3_stmt *stmt, int col,
 }
 
 
-static PgTypeInputTraits
-get_pgTypeInputTraits__(Oid pgtyp)
-{
-    PgTypeInputTraits traits;
-	HeapTuple tuple;
-	
-    traits.pgtyp = pgtyp;
-    tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(pgtyp));
-	if (!HeapTupleIsValid(tuple))
-    {
-		elog(ERROR, "cache lookup failed for type%u", pgtyp);
-        traits.valid = false;
-    }
-    else
-    {
-        traits.typeinput = ((Form_pg_type)GETSTRUCT(tuple))->typinput;
-	    traits.typmod  = ((Form_pg_type)GETSTRUCT(tuple))->typtypmod;
-        traits.valid = true;
-    }
-	
-	ReleaseSysCache(tuple);
-    return traits;
-}
 
 
 Datum
@@ -1195,9 +1171,9 @@ sqlite_bind_param_values(ForeignScanState *node)
 void
 cleanup_(SqliteFdwExecutionState *festate)
 {
-    dispose_sqlite(festate->db, festate->stmt);
-    festate->db = NULL;
-    festate->stmt = NULL;
+    dispose_sqlite(&festate->db, &festate->stmt);
+    // pfree(festate->traits);
+    // festate->traits = NULL;
 }
 
 
@@ -1396,30 +1372,30 @@ find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel)
 }
 
 
-int 
+int8
 get_rowCount(char const *database, char const *table)
 {
     sqlite3 *db = get_sqliteDbHandle(database);
     char *query = palloc0(strlen(table) + 32);
     sqlite3_stmt *volatile stmt;
-    int rowcount = 0;
+    int8 rowcount = 0;
 
     sprintf(query, "select count(*) from %s", quote_identifier(table));
     PG_TRY();
     {
         stmt = prepare_sqliteQuery(db, query, NULL);
         if (sqlite3_step(stmt) == SQLITE_OK)
-            rowcount = sqlite3_column_int(stmt, 0);
+            rowcount = sqlite3_column_int64(stmt, 0);
     }
     PG_CATCH();
     {
-        dispose_sqlite(db, stmt);
+        dispose_sqlite(&db, (sqlite3_stmt **)&stmt);
         pfree(query);
         PG_RE_THROW();
     }
     PG_END_TRY();
 
-    dispose_sqlite(db, stmt);
+    dispose_sqlite(&db, (sqlite3_stmt **)&stmt);
     pfree(query);
     
     return rowcount;
@@ -1475,6 +1451,20 @@ get_numPages(Relation relation)
 static void
 collect_foreignSample__(SqliteAnalyzeState *state, sqlite3_stmt *stmt)
 {
+    TupleTableSlot *slot = state->slot;
+    HeapTuple tuple;
+
+    populate_tupleTableSlot(stmt, slot, state->retrieved_attrs, 
+                            state->traits);
+    tuple = heap_form_tuple(slot->tts_tupleDescriptor, 
+                            slot->tts_values, 
+                            slot->tts_isnull);
+	HeapTupleHeaderSetXmax(tuple->t_data, InvalidTransactionId);
+	HeapTupleHeaderSetXmin(tuple->t_data, InvalidTransactionId);
+	HeapTupleHeaderSetCmin(tuple->t_data, InvalidTransactionId);
+
+    state->rows[state->numsamples] = tuple;
+    state->numsamples++;
 }
 
 
@@ -1482,7 +1472,7 @@ void
 collect_foreignSamples(SqliteAnalyzeState *state, StringInfoData sql)
 {
     sqlite3 *db = get_sqliteDbHandle(state->src.database);
-    sqlite3_stmt *volatile stmt = NULL;
+    sqlite3_stmt *volatile stmt;
     
     PG_TRY();
     {
@@ -1496,11 +1486,11 @@ collect_foreignSamples(SqliteAnalyzeState *state, StringInfoData sql)
     }
     PG_CATCH();
     {
-        dispose_sqlite(db, stmt);
+        dispose_sqlite(&db, (sqlite3_stmt **)&stmt);
         PG_RE_THROW();
     }
     PG_END_TRY();
-    dispose_sqlite(db, stmt);
+    dispose_sqlite(&db, (sqlite3_stmt **)&stmt);
 }
 
 
@@ -1525,6 +1515,33 @@ populate_tupleTableSlot(sqlite3_stmt *stmt,
         retrieve_col++;
     }
     ExecStoreVirtualTuple(slot);
+}
+
+    
+static PgTypeInputTraits
+get_pgTypeInputTraits__(Oid pgtyp)
+{
+    PgTypeInputTraits traits = {0};
+	HeapTuple tuple;
+    Form_pg_type typeform;
+	
+    traits.pgtyp = pgtyp;
+    tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(pgtyp));
+	if (!HeapTupleIsValid(tuple))
+    {
+		elog(ERROR, "cache lookup failed for type%u", pgtyp);
+        traits.valid = false;
+    }
+    else
+    {
+        typeform = ((Form_pg_type)GETSTRUCT(tuple));
+        traits.typeinput = typeform->typinput;
+	    traits.typmod  = typeform->typtypmod;
+        traits.valid = true;
+    }
+	
+	ReleaseSysCache(tuple);
+    return traits;
 }
 
 

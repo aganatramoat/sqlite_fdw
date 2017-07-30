@@ -109,19 +109,6 @@ typedef struct
 
 typedef struct
 {
-    Relation    relation;
-    List        *retrieved_attrs;
-    HeapTuple   *rows;    // space to store the sampled rows
-    int8        toskip;   // skip these many before storing a row
-    int8        targrows; // number of rows we want to collect
-    int8        numsamples; // how many rows did we actually collect
-    SqliteTableSource src;
-    int8        count;
-} SqliteAnalyzeState;
-
-
-typedef struct
-{
     regproc   typeinput;
     int       typmod;
     bool      valid;
@@ -147,6 +134,21 @@ typedef struct
     bool   params_bound;
     PgTypeInputTraits *traits;
 } SqliteFdwExecutionState;
+
+
+typedef struct
+{
+    Relation    relation;
+    List        *retrieved_attrs;
+    HeapTuple   *rows;    // space to store the sampled rows
+    int8        toskip;   // skip these many before storing a row
+    int8        targrows; // number of rows we want to collect
+    int8        numsamples; // how many rows did we actually collect
+    SqliteTableSource src;
+    int8              count;   // total number of rows in table
+    PgTypeInputTraits *traits; // Oids of input functions.
+    TupleTableSlot    *slot;   // working space to gather data from row.
+} SqliteAnalyzeState;
 
 
 /*
@@ -246,12 +248,12 @@ Expr * find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel);
 void reset_transmission_modes(int nestlevel);
 int get_rowSize(Relation relation);
 int get_numPages(Relation relation);
-int get_rowCount(char const *database, char const *table);
+int8 get_rowCount(char const *database, char const *table);
 void collect_foreignSamples(SqliteAnalyzeState *, StringInfoData sql);
-void populate_tupleTableSlot(sqlite3_stmt *stmt, TupleTableSlot *slot,
+void populate_tupleTableSlot(struct sqlite3_stmt *stmt, TupleTableSlot *slot,
                              List *retrieved_attrs,
                              PgTypeInputTraits *traits);
-void dispose_sqlite(sqlite3 *db, sqlite3_stmt *stmt);
+void dispose_sqlite(struct sqlite3 **db, struct sqlite3_stmt **stmt);
 PgTypeInputTraits *get_pgTypeInputTraits(TupleDesc desc);
 
 #define FDW_RELINFO(X)  ((SqliteFdwRelationInfo *)X)

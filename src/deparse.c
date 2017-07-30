@@ -1876,7 +1876,6 @@ deparseScalarArrayOpExpr(ScalarArrayOpExpr *node, deparse_expr_cxt *context)
 	appendStringInfoChar(buf, ' ');
 
 	/* Deparse operator name plus decoration. */
-	// deparseOperatorName(buf, form);
 	appendStringInfo(buf, " IN (");
 
 	/* Deparse right operand. */
@@ -2435,4 +2434,47 @@ get_relation_column_alias_ids(Var *node, RelOptInfo *foreignrel,
 
 	/* Shouldn't get here */
 	elog(ERROR, "unexpected expression in subquery output");
+}
+
+
+static const char * 
+get_colname__(int attrnum, Form_pg_attribute attr, Oid relid)
+{
+	ListCell   *lc;
+    
+    foreach(lc, GetForeignColumnOptions(relid, attrnum + 1))
+    {
+        DefElem    *def = (DefElem *) lfirst(lc);
+        if (strcmp(def->defname, "column_name") == 0)
+            return defGetString(def);
+    }
+    return NameStr(attr->attname);
+}
+
+StringInfoData
+construct_foreignSamplesQuery(SqliteAnalyzeState *state)
+{
+    StringInfoData sql;
+	TupleDesc	tupdesc = RelationGetDescr(state->relation);
+	Oid			relid = RelationGetRelid(state->relation);
+    int i = 0;
+    bool first = true;
+
+    initStringInfo(&sql);
+	appendStringInfoString(&sql, "SELECT ");
+
+    for ( i = 0; i < tupdesc->natts; i++ )
+    {
+		if (tupdesc->attrs[i]->attisdropped)
+			continue;
+		if (!first)
+			appendStringInfoString(&sql, ", ");
+		first = false;
+		appendStringInfoString(&sql, 
+                quote_identifier(get_colname__(i, tupdesc->attrs[i], relid)));
+        state->retrieved_attrs = lappend_int(
+                state->retrieved_attrs, i + 1);
+    }
+    
+    return sql;
 }

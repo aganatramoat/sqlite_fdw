@@ -26,7 +26,7 @@
 #include "callbacks.h"
 
 
-static int8 ESTIMATED_NUM_PAGES = 0;
+static int8 SQLITE_ANALYZE_NUM_ROWS = 0;
 
 
 void
@@ -203,6 +203,9 @@ get_foreignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid)
 									   NIL);	/* no fdw_private list */
 		add_path(baserel, (Path *) path);
 	}
+    
+    // elog(SQLITE_FDW_LOG_LEVEL, "XXXXXX pid is %d", getpid());
+    // raise(SIGSTOP);
 }
 
     
@@ -662,7 +665,7 @@ begin_foreignScan(ForeignScanState *node, int eflags)
 List *
 import_foreignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 {
-	sqlite3		   *volatile db = NULL;
+	sqlite3		   *db = NULL;
 	sqlite3_stmt   *volatile tbls = NULL;
 	char		   *filename = NULL;
 	List		   *commands = NIL;
@@ -724,12 +727,12 @@ import_foreignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 	}
 	PG_CATCH();
 	{
-        dispose_sqlite(db, tbls);
+        dispose_sqlite(&db, (sqlite3_stmt **)&tbls);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
     
-    dispose_sqlite(db, tbls);
+    dispose_sqlite(&db, (sqlite3_stmt **)&tbls);
 	return commands;
 }
 
@@ -776,12 +779,12 @@ explain_foreignScan(ForeignScanState *node, ExplainState *es)
     }
     PG_CATCH();
     {
-        dispose_sqlite(NULL, stmt);
+        dispose_sqlite(NULL, (sqlite3_stmt **)&stmt);
         PG_RE_THROW();
     }
     PG_END_TRY();
 
-    dispose_sqlite(NULL, stmt);
+    dispose_sqlite(NULL, (sqlite3_stmt **)&stmt);
 }
 
 
@@ -794,17 +797,22 @@ acquire_foreignSamples(Relation relation, int elevel,
     SqliteAnalyzeState   state = {0};
 	StringInfoData sql;
 	ForeignTable *table = GetForeignTable(RelationGetRelid(relation));
+    TupleDesc desc = relation->rd_att;
     
     state.relation = relation;
     state.rows = rows;
     state.targrows = targrows;
     state.src = get_tableSource(table->relid);
+    state.traits = get_pgTypeInputTraits(desc);
+    state.slot = MakeTupleTableSlot();
+    state.slot->tts_tupleDescriptor = desc;
+    state.slot->tts_values = palloc(desc->natts * sizeof(Datum));
+    state.slot->tts_isnull = palloc(desc->natts * sizeof(bool));
     
-    *totalrows = (ESTIMATED_NUM_PAGES * BLCKSZ) / get_rowSize(relation);
     if (targrows > 0)
-        state.toskip = ((int8) *totalrows) / targrows - 1;
+        state.toskip = SQLITE_ANALYZE_NUM_ROWS / targrows - 1;
     else
-        state.toskip = (int8) *totalrows;
+        state.toskip = SQLITE_ANALYZE_NUM_ROWS;
     if (state.toskip <= 0)
         state.toskip = 1;
 
@@ -854,10 +862,9 @@ analyze_foreignTable(Relation relation, AcquireSampleRowsFunc *func,
 	ForeignTable *table = GetForeignTable(RelationGetRelid(relation));
     SqliteTableSource src = get_tableSource(table->relid);
     double rowsize = get_rowSize(relation);
-    double count = get_rowCount(src.database, src.table);
+    SQLITE_ANALYZE_NUM_ROWS = get_rowCount(src.database, src.table);
 
-    ESTIMATED_NUM_PAGES = *totalpages = (BlockNumber) ((rowsize * count) / 
-                                                       BLCKSZ);
+    *totalpages = (BlockNumber) ((rowsize * SQLITE_ANALYZE_NUM_ROWS) / BLCKSZ);
     *func = acquire_foreignSamples;
 	
     return true;
@@ -910,7 +917,10 @@ iterate_foreignScan(ForeignScanState *node)
 void
 end_foreignScan(ForeignScanState *node)
 {
-	cleanup_((SqliteFdwExecutionState *) node->fdw_state);
+    SqliteFdwExecutionState *festate = (SqliteFdwExecutionState *)
+                                            node->fdw_state;
+    printf("%s", "");
+	cleanup_(festate);
 }
 
     

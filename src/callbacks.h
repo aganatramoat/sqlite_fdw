@@ -1,6 +1,6 @@
 #ifndef SQLITE_FDW_CALLBACKS_H
 #define SQLITE_FDW_CALLBACKS_H
-// #pragma GCC visibility push(hidden)
+#pragma GCC visibility push(hidden)
 
 void get_foreignPaths(PlannerInfo *root, RelOptInfo *baserel, 
                       Oid foreigntableid);
@@ -26,5 +26,5 @@ List * import_foreignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid);
 bool analyze_foreignTable(Relation relation, AcquireSampleRowsFunc *func,
                           BlockNumber *totalpages);
 
-// #pragma GCC visibility pop
+#pragma GCC visibility pop
 #endif

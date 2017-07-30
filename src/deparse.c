@@ -1416,6 +1416,7 @@ deparseVar(Var *node, deparse_expr_cxt *context)
 }
 
 
+/*
 static bool
 const_is_array(Const * node)
 {
@@ -1432,6 +1433,7 @@ const_is_array(Const * node)
     ReleaseSysCache(tuple);
     return isarray;
 }
+*/
 
 /*
  * Deparse given constant value into context->buf.

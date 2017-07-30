@@ -1,6 +1,6 @@
 #ifndef SQLITE_FDW_PRIVATE_H
 #define SQLITE_FDW_PRIVATE_H
-// #pragma GCC visibility push(hidden)
+#pragma GCC visibility push(hidden)
 
 #define SQLITE_FDW_LOG_LEVEL WARNING
 #define DEFAULT_FDW_SORT_MULTIPLIER 1.2
@@ -259,5 +259,5 @@ PgTypeInputTraits *get_pgTypeInputTraits(TupleDesc desc);
 #define FDW_RELINFO(X)  ((SqliteFdwRelationInfo *)X)
 
 
-// #pragma GCC visibility pop
+#pragma GCC visibility pop
 #endif

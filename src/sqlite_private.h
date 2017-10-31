@@ -231,6 +231,7 @@ char *get_foreignTableCreationSql(ImportForeignSchemaStmt *stmt,
                                   struct sqlite3 *db,
                                   char const * tablename,
                                   SqliteTableImportOptions options);
+char *get_tableDropSql(char const *local_schema, char const * tablename);
 SqliteTableImportOptions get_sqliteTableImportOptions(
         ImportForeignSchemaStmt *stmt);
 void sqlite_bind_param_value(SqliteFdwExecutionState *festate,

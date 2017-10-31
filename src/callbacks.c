@@ -714,8 +714,11 @@ import_foreignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
             char *tablename = (char *) sqlite3_column_text(tbls, 0);
             char *cftsql = get_foreignTableCreationSql(
                             stmt, db, tablename, importOptions);
-            if ( cftsql )
+            if ( cftsql ) {
+                commands = lappend(
+                    commands, get_tableDropSql(stmt->local_schema, tablename));
                 commands = lappend(commands, cftsql);
+            }
 		}
 	}
 	PG_CATCH();

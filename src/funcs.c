@@ -346,6 +346,22 @@ is_sqliteTableRequired(ImportForeignSchemaStmt *stmt,
 }
 
 
+char *
+get_tableDropSql(char const *local_schema, char const *tablename)
+{
+    StringInfoData	dropsql;
+    dropsql.data = NULL;
+    initStringInfo(&dropsql);
+
+    appendStringInfo(&dropsql,
+        "drop table %s.%s if exists cascade",
+        local_schema, 
+        quote_identifier(tablename));
+    
+    return dropsql.data;
+}
+
+
 char * 
 get_foreignTableCreationSql(ImportForeignSchemaStmt *stmt,
                             sqlite3 * db,

@@ -354,7 +354,7 @@ get_tableDropSql(char const *local_schema, char const *tablename)
     initStringInfo(&dropsql);
 
     appendStringInfo(&dropsql,
-        "drop table %s.%s if exists cascade",
+        "drop table if exists %s.%s cascade",
         local_schema, 
         quote_identifier(tablename));
     

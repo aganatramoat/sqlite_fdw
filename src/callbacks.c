@@ -640,7 +640,7 @@ begin_foreignScan(ForeignScanState *node, int eflags)
     festate->param_exprs = ExecInitExprList(fsplan->fdw_exprs, 
                                             (PlanState *)node);
     festate->traits = get_pgTypeInputTraits(
-            node->ss.ss_currentRelation->rd_att);
+            node->ss.ss_ScanTupleSlot->tts_tupleDescriptor);
     
     PG_TRY();
     {

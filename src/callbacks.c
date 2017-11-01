@@ -715,8 +715,6 @@ import_foreignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
             char *cftsql = get_foreignTableCreationSql(
                             stmt, db, tablename, importOptions);
             if ( cftsql ) {
-                commands = lappend(
-                    commands, get_tableDropSql(stmt->local_schema, tablename));
                 commands = lappend(commands, cftsql);
             }
 		}
